@@ -10,8 +10,11 @@ This repository ships a working MVP of the architecture described in
 - **Backend** — Spring Boot (Java 21) + PostgreSQL via Spring Data JPA & Flyway
 - **Frontend** — Angular 18 (standalone components + signals), dark, gradient-accented UI
 - **Engine** — a real orchestrator loop against a custom **vLLM** (OpenAI-compatible)
-  provider with tool calling: it injects skill instructions, executes **native functions**
-  and **builtin MCP REST integrations** live, and produces a full, auditable trace per run.
+  provider with tool calling. Within one flow session it can: call functions and **builtin MCP
+  operations repeatedly** (with **pagination** metadata to walk result pages); **load skills on
+  demand** (progressive disclosure — a flow can carry many skills yet pull in only what it needs);
+  and **delegate to parallel or chained sub-agents**. All tool activity shares a single hard budget
+  of **120 tool iterations** per session, and every step is captured in a full, auditable trace.
   With no provider enabled it falls back to a deterministic simulation so the app still demos.
 - **Packaging** — the Angular app is built and served as static resources by the Spring
   Boot backend, so **everything runs from a single Docker image**, orchestrated with
@@ -73,13 +76,19 @@ npm start        # http://localhost:4200
 
 ## Capabilities
 
-- **Skills** — instruction packages injected into the orchestrator on activation (base skills
-  seeded: orchestration, concatenation, extraction, ranking/triage, synthesis-with-citations).
+- **Skills** — instruction packages for the orchestrator. `spec.loads` controls disclosure:
+  `always` skills are injected up front; `on-demand` skills are only advertised and pulled in
+  live via the `load_skill` tool when the task needs them — so a flow can carry many skills yet
+  load only the few it uses on a given run, and re-load any of them as often as needed.
 - **Functions** — native backend code, runnable live: `concatenate`, `dedupe_by_embedding`,
   `rank_by_relevance`, `read_url_fn`.
 - **MCP servers** — two kinds: **external** (a real MCP server) and **builtin** (an in-platform
   REST integration you configure with base URL, auth header and operations — each operation
-  becomes a callable tool). A live example (`public-holidays`) is seeded.
+  becomes a callable tool). Mark an operation `paginated: true` to get `pageInfo` (`hasMore` plus
+  `nextPage`/`nextCursor`) so the orchestrator can page through results. Live examples
+  (`public-holidays`, paginated `demo-posts`) are seeded.
+- Each capability type has an authoring guide at `GET /api/capabilities/help`, surfaced as a
+  **How to create a …** panel in the Capability Registry.
 - Test any function or builtin MCP operation in isolation via `POST /api/capabilities/{id}/test`
   or the **Test live** panel in the Capability Registry.
 

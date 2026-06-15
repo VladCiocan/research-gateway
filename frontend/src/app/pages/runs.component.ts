@@ -97,6 +97,7 @@ import { Run } from '../core/models';
     .step-icon.sm { width: 12px; height: 12px; margin-top: 3px; z-index: 1; }
     .step-icon.sm.plan { background: var(--violet); } .step-icon.sm.subagent { background: var(--teal); }
     .step-icon.sm.synthesis { background: var(--pink); } .step-icon.sm.guardrail { background: var(--amber); }
+    .step-icon.sm.tool_call { background: var(--blue); } .step-icon.sm.skill { background: var(--violet-soft); }
     .step-body strong { font-size: 13.5px; }
     .detail2 { font-size: 12.5px; }
     .detail-box .detail { font-size: 12.5px; }

@@ -27,6 +27,12 @@ public class CapabilityController {
         return service.list(type);
     }
 
+    /** Authoring guides explaining how to create each capability type. */
+    @GetMapping("/help")
+    public List<Map<String, Object>> help() {
+        return CapabilityHelp.guides();
+    }
+
     @GetMapping("/{id}")
     public CapabilityDto get(@PathVariable UUID id) {
         return service.get(id);

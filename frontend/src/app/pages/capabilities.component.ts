@@ -2,7 +2,7 @@ import { Component, OnInit, computed, inject, signal } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { ApiService } from '../core/api.service';
-import { Capability, CapabilityType } from '../core/models';
+import { Capability, CapabilityHelp, CapabilityType } from '../core/models';
 
 @Component({
   selector: 'rg-capabilities',
@@ -60,6 +60,45 @@ import { Capability, CapabilityType } from '../core/models';
           </div>
           <label class="field" style="margin-top:14px"><span>Description (model-visible)</span>
             <input class="input" [(ngModel)]="form.description" placeholder="Short description" /></label>
+
+          @if (help(); as h) {
+            <div class="help-box">
+              <button type="button" class="help-head" (click)="showHelp.set(!showHelp())">
+                <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 16v-4M12 8h.01"/></svg>
+                <span>How to create a {{ h.title }}</span>
+                <span class="spacer"></span>
+                <span class="chev" [class.open]="showHelp()">▾</span>
+              </button>
+              @if (showHelp()) {
+                <div class="help-body">
+                  <p class="help-summary">{{ h.summary }}</p>
+                  <p class="help-how">{{ h.howTo }}</p>
+                  @if (h.fields.length) {
+                    <div class="help-fields">
+                      @for (f of h.fields; track f.key) {
+                        <div class="help-field">
+                          <code>{{ f.key }}</code>
+                          <span class="req" [class.on]="f.required">{{ f.required ? 'required' : 'optional' }}</span>
+                          <span class="fd">{{ f.description }}</span>
+                        </div>
+                      }
+                    </div>
+                  }
+                  <div class="row help-ex-head">
+                    <strong>Example spec</strong>
+                    <span class="spacer"></span>
+                    <button type="button" class="btn btn-ghost btn-sm" (click)="useExample()">Use example</button>
+                  </div>
+                  <pre class="code help-code">{{ exampleText() }}</pre>
+                  @if (h.tips.length) {
+                    <ul class="help-tips">
+                      @for (t of h.tips; track t) { <li>{{ t }}</li> }
+                    </ul>
+                  }
+                </div>
+              }
+            </div>
+          }
 
           @if (form.type === 'mcp') {
             <label class="field" style="margin-top:14px"><span>MCP kind</span>
@@ -150,6 +189,25 @@ import { Capability, CapabilityType } from '../core/models';
     .test-box { margin-top: 18px; padding: 16px; border-radius: 12px; background: rgba(8,10,20,0.4); border: 1px solid var(--border); }
     .test-box strong { font-size: 13.5px; }
     .code { margin-top: 10px; background: rgba(8,10,20,0.7); border: 1px solid var(--border); border-radius: 10px; padding: 12px; font-family: var(--mono); font-size: 12px; line-height: 1.5; max-height: 240px; overflow: auto; white-space: pre-wrap; word-break: break-word; }
+    .help-box { margin-top: 14px; border: 1px solid var(--border); border-radius: 12px; background: var(--grad-soft); overflow: hidden; }
+    .help-head { display: flex; align-items: center; gap: 9px; width: 100%; text-align: left; padding: 11px 14px; color: var(--text); font-weight: 600; font-size: 13.5px; background: transparent; }
+    .help-head svg { color: var(--violet); flex: none; }
+    .chev { transition: transform 0.18s ease; color: var(--text-dim); }
+    .chev.open { transform: rotate(180deg); }
+    .help-body { padding: 4px 16px 16px; border-top: 1px solid var(--border); }
+    .help-summary { font-size: 13px; color: var(--text); margin-top: 12px; }
+    .help-how { font-size: 12.5px; color: var(--text-dim); margin-top: 8px; line-height: 1.55; }
+    .help-fields { display: flex; flex-direction: column; gap: 6px; margin-top: 12px; }
+    .help-field { display: grid; grid-template-columns: minmax(90px, auto) auto 1fr; gap: 10px; align-items: baseline; font-size: 12.5px; }
+    .help-field code { color: var(--teal); font-family: var(--mono); font-size: 12px; }
+    .help-field .req { font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-dim); }
+    .help-field .req.on { color: var(--pink); }
+    .help-field .fd { color: var(--text-dim); }
+    .help-ex-head { margin-top: 16px; align-items: center; }
+    .help-ex-head strong { font-size: 12.5px; }
+    .help-code { max-height: 200px; }
+    .help-tips { margin: 14px 0 0; padding-left: 18px; display: flex; flex-direction: column; gap: 5px; }
+    .help-tips li { font-size: 12.5px; color: var(--text-dim); line-height: 1.5; }
     @media (max-width: 980px) { .layout { grid-template-columns: 1fr; } .editor { position: static; } .g2 { grid-template-columns: 1fr; } }
   `],
 })
@@ -158,6 +216,8 @@ export class CapabilitiesComponent implements OnInit {
   types: CapabilityType[] = ['skill', 'tool', 'function', 'mcp'];
 
   items = signal<Capability[]>([]);
+  helps = signal<CapabilityHelp[]>([]);
+  showHelp = signal(true);
   filter = signal<string>('');
   editing = signal<Capability | null>(null);
   creating = signal(false);
@@ -179,11 +239,39 @@ export class CapabilitiesComponent implements OnInit {
     return f ? this.items().filter((c) => c.type === f) : this.items();
   });
 
-  ngOnInit(): void { this.load(); }
+  ngOnInit(): void {
+    this.load();
+    this.api.capabilityHelp().subscribe((h) => this.helps.set(h));
+  }
 
   load(): void { this.api.listCapabilities().subscribe((c) => this.items.set(c)); }
   count = (t: string) => this.items().filter((c) => c.type === t).length;
   mcpKind = (c: Capability) => (c.spec?.['kind'] as string) || 'external';
+
+  // Method (not computed) so it tracks form.type, which ngModel mutates outside signals.
+  help(): CapabilityHelp | null {
+    return this.helps().find((h) => h.type === this.form.type) ?? null;
+  }
+  exampleText(): string {
+    const h = this.help();
+    return h ? JSON.stringify(h.example, null, 2) : '';
+  }
+
+  /** Populate the spec editor (and MCP fields) from the type's example. */
+  useExample(): void {
+    const ex = this.help()?.example;
+    if (!ex) return;
+    if (this.form.type === 'mcp') {
+      const kind = (ex['kind'] as string) || 'builtin';
+      this.form.kind = kind;
+      if (kind === 'builtin') {
+        this.form.baseUrl = (ex['base_url'] as string) ?? '';
+        this.form.authHeader = (ex['auth_header'] as string) ?? '';
+        this.operationsText = JSON.stringify(ex['operations'] ?? [], null, 2);
+      }
+    }
+    this.specText = JSON.stringify(ex, null, 2);
+  }
 
   canSave(): boolean {
     if (!this.form.name.trim()) return false;

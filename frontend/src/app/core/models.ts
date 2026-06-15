@@ -42,6 +42,22 @@ export interface FlowRequest {
   capabilityIds?: string[];
 }
 
+export interface CapabilityHelpField {
+  key: string;
+  required: boolean;
+  description: string;
+}
+
+export interface CapabilityHelp {
+  type: CapabilityType;
+  title: string;
+  summary: string;
+  howTo: string;
+  fields: CapabilityHelpField[];
+  example: Record<string, unknown>;
+  tips: string[];
+}
+
 export interface Provider {
   id: string;
   name: string;
@@ -72,7 +88,7 @@ export interface ProviderRequest {
 export interface RunStep {
   id: string;
   seq: number;
-  type: 'plan' | 'subagent' | 'tool_call' | 'synthesis' | 'guardrail';
+  type: 'plan' | 'subagent' | 'tool_call' | 'synthesis' | 'guardrail' | 'skill';
   title: string;
   detail?: string;
   payload: Record<string, unknown>;

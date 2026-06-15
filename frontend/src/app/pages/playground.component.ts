@@ -117,6 +117,7 @@ import { Flow, Run, RunStep } from '../core/models';
     .step-icon.synthesis { border-color: var(--pink); background: var(--pink); }
     .step-icon.guardrail { border-color: var(--amber); background: var(--amber); }
     .step-icon.tool_call { border-color: var(--blue); background: var(--blue); }
+    .step-icon.skill { border-color: var(--violet-soft); background: var(--violet-soft); }
     .step-body { flex: 1; padding-top: 1px; }
     .step-body strong { font-size: 14.5px; }
     .detail { font-size: 13px; margin-top: 4px; }

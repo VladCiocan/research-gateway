@@ -2,7 +2,7 @@ import { HttpClient } from '@angular/common/http';
 import { Injectable, inject } from '@angular/core';
 import { Observable } from 'rxjs';
 import {
-  Capability, CapabilityRequest, Flow, FlowRequest, Provider, ProviderRequest, Run,
+  Capability, CapabilityHelp, CapabilityRequest, Flow, FlowRequest, Provider, ProviderRequest, Run,
 } from './models';
 
 @Injectable({ providedIn: 'root' })
@@ -25,6 +25,9 @@ export class ApiService {
   listCapabilities(type?: string): Observable<Capability[]> {
     const q = type ? `?type=${type}` : '';
     return this.http.get<Capability[]>(`${this.base}/capabilities${q}`);
+  }
+  capabilityHelp(): Observable<CapabilityHelp[]> {
+    return this.http.get<CapabilityHelp[]>(`${this.base}/capabilities/help`);
   }
   createCapability(body: CapabilityRequest): Observable<Capability> {
     return this.http.post<Capability>(`${this.base}/capabilities`, body);
