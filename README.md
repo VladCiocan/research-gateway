@@ -9,8 +9,10 @@ This repository ships a working MVP of the architecture described in
 
 - **Backend** — Spring Boot (Java 21) + PostgreSQL via Spring Data JPA & Flyway
 - **Frontend** — Angular 18 (standalone components + signals), dark, gradient-accented UI
-- **Engine** — a simulated orchestrator–worker loop (plan → subagents → triage → synthesis)
-  that produces a full, auditable trace per run
+- **Engine** — a real orchestrator loop against a custom **vLLM** (OpenAI-compatible)
+  provider with tool calling: it injects skill instructions, executes **native functions**
+  and **builtin MCP REST integrations** live, and produces a full, auditable trace per run.
+  With no provider enabled it falls back to a deterministic simulation so the app still demos.
 - **Packaging** — the Angular app is built and served as static resources by the Spring
   Boot backend, so **everything runs from a single Docker image**, orchestrated with
   Docker Compose alongside Postgres.
@@ -67,7 +69,28 @@ npm start        # http://localhost:4200
 | **Capabilities** | CRUD registry for skills / tools / functions / MCP servers |
 | **Playground** | Run a flow with live trace, tokens, cost and cited synthesis |
 | **Runs** | Full execution history with drill-down into each trace |
-| **Settings** | Providers, MCP connectors, API keys, deployment info |
+| **Settings** | Manage custom vLLM providers (base URL, model, context size, sampling) + test connection |
+
+## Capabilities
+
+- **Skills** — instruction packages injected into the orchestrator on activation (base skills
+  seeded: orchestration, concatenation, extraction, ranking/triage, synthesis-with-citations).
+- **Functions** — native backend code, runnable live: `concatenate`, `dedupe_by_embedding`,
+  `rank_by_relevance`, `read_url_fn`.
+- **MCP servers** — two kinds: **external** (a real MCP server) and **builtin** (an in-platform
+  REST integration you configure with base URL, auth header and operations — each operation
+  becomes a callable tool). A live example (`public-holidays`) is seeded.
+- Test any function or builtin MCP operation in isolation via `POST /api/capabilities/{id}/test`
+  or the **Test live** panel in the Capability Registry.
+
+## Connecting a vLLM provider
+
+1. Start vLLM with its OpenAI-compatible server, e.g.
+   `python -m vllm.entrypoints.openai.api_server --model <model> --port 8000`.
+2. In **Settings**, point the provider's base URL at `http://host.docker.internal:8000/v1`
+   (the compose file maps `host.docker.internal` to the host), set the model, context size and
+   sampling, **enable** it, and hit **Test connection**.
+3. Runs now execute live; the Playground shows the real tool calls and synthesis.
 
 ## Architecture notes
 

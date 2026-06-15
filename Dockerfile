@@ -41,6 +41,15 @@ RUN mvn -q -B -DskipTests package
 FROM eclipse-temurin:21-jre AS runtime
 WORKDIR /app
 RUN groupadd --system app && useradd --system --gid app app
+# Optionally trust custom CA certs at runtime (outbound HTTPS to MCP/LLM behind a proxy).
+COPY certs/ /tmp/certs/
+RUN if ls /tmp/certs/*.crt >/dev/null 2>&1; then \
+      for c in /tmp/certs/*.crt; do \
+        keytool -importcert -noprompt -trustcacerts \
+          -alias "$(basename "$c")" -file "$c" \
+          -keystore "$JAVA_HOME/lib/security/cacerts" -storepass changeit; \
+      done; \
+    fi
 COPY --from=backend /app/target/research-gateway.jar ./app.jar
 EXPOSE 8080
 USER app

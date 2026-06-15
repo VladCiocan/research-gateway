@@ -9,6 +9,7 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 
 @RestController
@@ -45,5 +46,11 @@ public class CapabilityController {
     public ResponseEntity<Void> delete(@PathVariable UUID id) {
         service.delete(id);
         return ResponseEntity.noContent().build();
+    }
+
+    @PostMapping("/{id}/test")
+    public Map<String, Object> test(@PathVariable UUID id,
+                                    @RequestBody(required = false) Map<String, Object> body) {
+        return service.test(id, body);
     }
 }

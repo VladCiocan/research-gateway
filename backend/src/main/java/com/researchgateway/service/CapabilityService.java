@@ -3,6 +3,8 @@ package com.researchgateway.service;
 import com.researchgateway.domain.Capability;
 import com.researchgateway.dto.CapabilityDto;
 import com.researchgateway.dto.CapabilityRequest;
+import com.researchgateway.engine.McpConnector;
+import com.researchgateway.engine.functions.FunctionRegistry;
 import com.researchgateway.repository.CapabilityRepository;
 import com.researchgateway.web.NotFoundException;
 import org.springframework.stereotype.Service;
@@ -10,6 +12,7 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 
 @Service
@@ -17,9 +20,36 @@ import java.util.UUID;
 public class CapabilityService {
 
     private final CapabilityRepository repository;
+    private final FunctionRegistry functions;
+    private final McpConnector mcp;
 
-    public CapabilityService(CapabilityRepository repository) {
+    public CapabilityService(CapabilityRepository repository,
+                             FunctionRegistry functions, McpConnector mcp) {
         this.repository = repository;
+        this.functions = functions;
+        this.mcp = mcp;
+    }
+
+    /** Run a single capability in isolation with caller-supplied input. */
+    public Map<String, Object> test(UUID id, Map<String, Object> body) {
+        Capability c = find(id);
+        Map<String, Object> args = body != null && body.get("args") instanceof Map
+                ? (Map<String, Object>) body.get("args")
+                : (body != null ? body : Map.of());
+        try {
+            if ("function".equals(c.getType()) && functions.has(c.getSlug())) {
+                return Map.of("ok", true, "result", functions.get(c.getSlug()).execute(args));
+            }
+            if ("mcp".equals(c.getType()) && mcp.isBuiltin(c)) {
+                String op = body != null ? String.valueOf(body.getOrDefault("operation", "")) : "";
+                if (op.isBlank()) return Map.of("ok", false, "message", "Provide an 'operation' to test.");
+                return Map.of("ok", true, "result", mcp.execute(c, op, args));
+            }
+        } catch (Exception ex) {
+            return Map.of("ok", false, "message", ex.getMessage());
+        }
+        return Map.of("ok", false,
+                "message", "This capability type is not directly testable (no live runtime).");
     }
 
     @Transactional(readOnly = true)

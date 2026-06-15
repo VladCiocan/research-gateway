@@ -42,6 +42,33 @@ export interface FlowRequest {
   capabilityIds?: string[];
 }
 
+export interface Provider {
+  id: string;
+  name: string;
+  type: string;
+  baseUrl: string;
+  hasApiKey: boolean;
+  model: string;
+  contextSize: number;
+  maxTokens: number;
+  temperature: number;
+  enabled: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ProviderRequest {
+  name: string;
+  type?: string;
+  baseUrl: string;
+  apiKey?: string;
+  model: string;
+  contextSize?: number;
+  maxTokens?: number;
+  temperature?: number;
+  enabled?: boolean;
+}
+
 export interface RunStep {
   id: string;
   seq: number;

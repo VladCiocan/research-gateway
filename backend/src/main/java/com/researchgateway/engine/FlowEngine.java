@@ -1,9 +1,18 @@
 package com.researchgateway.engine;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.researchgateway.domain.Capability;
 import com.researchgateway.domain.Flow;
+import com.researchgateway.domain.Provider;
 import com.researchgateway.domain.Run;
 import com.researchgateway.domain.RunStep;
+import com.researchgateway.engine.functions.BackendFunction;
+import com.researchgateway.engine.functions.FunctionRegistry;
+import com.researchgateway.llm.LlmClient;
+import com.researchgateway.llm.LlmTypes.ChatResult;
+import com.researchgateway.llm.LlmTypes.ToolCall;
+import com.researchgateway.llm.LlmTypes.ToolDef;
+import com.researchgateway.repository.ProviderRepository;
 import org.springframework.stereotype.Component;
 
 import java.math.BigDecimal;
@@ -13,93 +22,277 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.ThreadLocalRandom;
 
 /**
- * Simulated orchestrator–worker research engine.
+ * Flow execution engine.
  *
- * <p>Real LLM providers are not wired in this build; instead the engine produces a
- * deterministic-looking agentic trace (plan → subagents → triage → synthesis) so the
- * gateway, playground and observability surfaces are fully functional end-to-end.
+ * <p>When a provider is enabled it runs a real orchestrator loop against an
+ * OpenAI-compatible (vLLM) endpoint with tool calling — executing native functions
+ * and builtin MCP REST integrations live. With no provider configured it falls back
+ * to a deterministic simulation so the product is still demoable offline.
  */
 @Component
 public class FlowEngine {
 
-    private int seq = 0;
+    private static final double COST_PER_TOKEN = 0.0000004;
+
+    private final ProviderRepository providerRepository;
+    private final LlmClient llmClient;
+    private final FunctionRegistry functions;
+    private final McpConnector mcp;
+    private final ObjectMapper mapper = new ObjectMapper();
+
+    private int seq;
+
+    public FlowEngine(ProviderRepository providerRepository, LlmClient llmClient,
+                      FunctionRegistry functions, McpConnector mcp) {
+        this.providerRepository = providerRepository;
+        this.llmClient = llmClient;
+        this.functions = functions;
+        this.mcp = mcp;
+    }
 
     public void execute(Run run, Flow flow) {
         seq = 0;
         run.setStatus("running");
+        Optional<Provider> provider = providerRepository.findFirstByEnabledTrueOrderByUpdatedAtDesc();
+        if (provider.isPresent()) {
+            runLive(run, flow, provider.get());
+        } else {
+            simulate(run, flow);
+        }
+    }
 
+    // ---------------------------------------------------------------- live
+
+    private void runLive(Run run, Flow flow, Provider provider) {
+        String query = inputText(run);
+        int maxIterations = guardrailInt(flow, "max_iterations", 8);
+
+        List<ToolDef> tools = buildTools(flow);
+        List<Map<String, Object>> messages = new ArrayList<>();
+        messages.add(message("system", systemPrompt(flow, tools)));
+        messages.add(message("user",
+                "Request input (JSON):\n" + query + "\n\nProduce the requested research output."));
+
+        addStep(run, "plan", "Orchestrator initialized",
+                "Loaded provider '" + provider.getModel() + "', " + tools.size()
+                        + " tool(s) and the attached skills.",
+                Map.of("model", provider.getModel(), "tools",
+                        tools.stream().map(ToolDef::name).toList()), 0);
+
+        int totalTokens = 0;
+        String finalContent = null;
+
+        for (int i = 0; i < maxIterations; i++) {
+            ChatResult res = llmClient.chat(provider, messages, tools);
+            totalTokens += res.totalTokens();
+
+            if (!res.hasToolCalls()) {
+                finalContent = res.content();
+                break;
+            }
+
+            messages.add(assistantWithToolCalls(res));
+            for (ToolCall call : res.toolCalls()) {
+                Object result = dispatch(flow, call);
+                addStep(run, "tool_call", "Tool: " + call.name(),
+                        "Executed tool with model-provided arguments.",
+                        Map.of("name", call.name(), "arguments", call.arguments(), "result", result),
+                        res.totalTokens() / Math.max(1, res.toolCalls().size()));
+                messages.add(toolMessage(call.id(), call.name(), result));
+            }
+        }
+
+        // Force a final answer if the loop ended still wanting tools.
+        if (finalContent == null) {
+            ChatResult res = llmClient.chat(provider, messages, null);
+            totalTokens += res.totalTokens();
+            finalContent = res.content();
+        }
+
+        addStep(run, "synthesis", "Synthesis", "Final grounded answer composed by the orchestrator.",
+                Map.of("length", finalContent == null ? 0 : finalContent.length()), 0);
+
+        Map<String, Object> output = new LinkedHashMap<>();
+        output.put("summary", finalContent == null ? "" : finalContent);
+        output.put("model", provider.getModel());
+        finalize(run, output, totalTokens);
+    }
+
+    private List<ToolDef> buildTools(Flow flow) {
+        List<ToolDef> tools = new ArrayList<>();
+        for (Capability c : flow.getCapabilities()) {
+            if ("function".equals(c.getType()) && functions.has(c.getSlug())) {
+                BackendFunction fn = functions.get(c.getSlug());
+                tools.add(new ToolDef(fn.slug(), fn.description(), fn.inputSchema()));
+            } else if ("mcp".equals(c.getType()) && mcp.isBuiltin(c)) {
+                tools.addAll(mcp.toolDefs(c));
+            }
+        }
+        return tools;
+    }
+
+    private Object dispatch(Flow flow, ToolCall call) {
+        String name = call.name();
+        if (functions.has(name)) {
+            try {
+                return functions.get(name).execute(call.arguments());
+            } catch (Exception ex) {
+                return Map.of("error", ex.getMessage());
+            }
+        }
+        if (name.contains(McpConnector.SEP)) {
+            String slug = name.substring(0, name.indexOf(McpConnector.SEP));
+            String op = name.substring(name.indexOf(McpConnector.SEP) + McpConnector.SEP.length());
+            for (Capability c : flow.getCapabilities()) {
+                if ("mcp".equals(c.getType()) && c.getSlug().equals(slug) && mcp.isBuiltin(c)) {
+                    return mcp.execute(c, op, call.arguments());
+                }
+            }
+        }
+        return Map.of("error", "Tool '" + name + "' is not available live (external/unconfigured).");
+    }
+
+    private String systemPrompt(Flow flow, List<ToolDef> tools) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("You are the lead orchestrator for the research flow \"")
+                .append(flow.getName()).append("\".\n");
+        if (flow.getDescription() != null && !flow.getDescription().isBlank()) {
+            sb.append(flow.getDescription()).append("\n");
+        }
+        sb.append("\nUse the available tools to gather grounded evidence before answering. ");
+        if (guardrailBool(flow)) {
+            sb.append("Always include inline citations like [1], [2] for sources you used. ");
+        }
+        sb.append("When you have enough information, write the final answer with no further tool calls.\n");
+
+        List<Capability> skills = flow.getCapabilities().stream()
+                .filter(c -> "skill".equals(c.getType())).toList();
+        if (!skills.isEmpty()) {
+            sb.append("\nActivated skills:\n");
+            for (Capability s : skills) {
+                Object instr = s.getSpec().get("instructions");
+                sb.append("## ").append(s.getName()).append("\n")
+                        .append(instr != null ? instr : s.getDescription()).append("\n");
+            }
+        }
+        if (!tools.isEmpty()) {
+            sb.append("\nAvailable tools: ");
+            sb.append(String.join(", ", tools.stream().map(ToolDef::name).toList())).append(".\n");
+        }
+        return sb.toString();
+    }
+
+    // ------------------------------------------------------------- message helpers
+
+    private Map<String, Object> message(String role, String content) {
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("role", role);
+        m.put("content", content);
+        return m;
+    }
+
+    private Map<String, Object> assistantWithToolCalls(ChatResult res) {
+        List<Map<String, Object>> calls = new ArrayList<>();
+        for (ToolCall c : res.toolCalls()) {
+            calls.add(Map.of("id", c.id(), "type", "function",
+                    "function", Map.of("name", c.name(), "arguments", toJson(c.arguments()))));
+        }
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("role", "assistant");
+        m.put("content", res.content() == null ? "" : res.content());
+        m.put("tool_calls", calls);
+        return m;
+    }
+
+    private Map<String, Object> toolMessage(String id, String name, Object result) {
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("role", "tool");
+        m.put("tool_call_id", id);
+        m.put("name", name);
+        m.put("content", toJson(result));
+        return m;
+    }
+
+    private String toJson(Object o) {
+        try { return mapper.writeValueAsString(o); } catch (Exception e) { return String.valueOf(o); }
+    }
+
+    // ------------------------------------------------------------- simulation fallback
+
+    private void simulate(Run run, Flow flow) {
         String query = String.valueOf(run.getInput().getOrDefault("query",
                 run.getInput().getOrDefault("sector", "the requested topic")));
 
-        BigDecimal totalCost = BigDecimal.ZERO;
-        int totalTokens = 0;
+        addStep(run, "guardrail", "No LLM provider enabled — running simulation",
+                "Enable a vLLM provider in Settings to execute this flow live.", Map.of(), 0);
 
-        // 1. Plan
-        List<String> subQuestions = decompose(query);
-        totalTokens += addStep(run, "plan",
-                "Orchestrator decomposed the request",
-                "Lead agent broke the request into " + subQuestions.size() + " sub-questions and selected capabilities.",
+        int totalTokens = 0;
+        List<String> subQuestions = List.of(
+                "Background and current state of " + query,
+                "Key players and competitors related to " + query,
+                "Recent trends and signals around " + query,
+                "Risks, gaps and open questions about " + query);
+        totalTokens += addStep(run, "plan", "Orchestrator decomposed the request",
+                "Broke the request into " + subQuestions.size() + " sub-questions.",
                 Map.of("subQuestions", subQuestions,
                         "capabilities", flow.getCapabilities().stream().map(Capability::getName).toList()),
                 420);
 
-        // 2. Subagents — search (parallel, one per sub-question)
         List<Map<String, Object>> candidates = new ArrayList<>();
         for (int i = 0; i < subQuestions.size(); i++) {
-            String sq = subQuestions.get(i);
-            List<Map<String, Object>> found = fakeSources(sq, i);
+            List<Map<String, Object>> found = fakeSources(subQuestions.get(i), i);
             candidates.addAll(found);
-            totalTokens += addStep(run, "subagent",
-                    "Search subagent #" + (i + 1),
-                    "Searched sources for: \"" + sq + "\"",
-                    Map.of("task", sq, "sources", found),
+            totalTokens += addStep(run, "subagent", "Search subagent #" + (i + 1),
+                    "Searched sources for: \"" + subQuestions.get(i) + "\"",
+                    Map.of("task", subQuestions.get(i), "sources", found),
                     300 + ThreadLocalRandom.current().nextInt(200));
         }
 
-        // 3. Triage — filter / dedupe / rank
         List<Map<String, Object>> ranked = candidates.stream()
-                .sorted((a, b) -> Double.compare(
-                        (double) b.get("relevance"), (double) a.get("relevance")))
-                .limit(5)
-                .toList();
-        totalTokens += addStep(run, "subagent",
-                "Triage subagent — rank & dedupe",
-                "Deduplicated and ranked " + candidates.size() + " candidates down to " + ranked.size() + " by relevance.",
-                Map.of("kept", ranked.size(), "discarded", candidates.size() - ranked.size()),
-                260);
+                .sorted((a, b) -> Double.compare((double) b.get("relevance"), (double) a.get("relevance")))
+                .limit(5).toList();
+        totalTokens += addStep(run, "subagent", "Triage — rank & dedupe",
+                "Reduced " + candidates.size() + " candidates to " + ranked.size() + ".",
+                Map.of("kept", ranked.size()), 260);
 
-        // 4. Guardrail check
-        addStep(run, "guardrail",
-                "Guardrail check passed",
-                "Iterations, cost and timeout within configured limits.",
-                Map.of("maxCostUsd", flow.getConfig().getOrDefault("max_cost_usd", 2.5),
-                        "iterations", seq),
-                0);
-
-        // 5. Synthesis
-        List<Map<String, Object>> sources = new ArrayList<>(ranked);
-        String summary = synthesize(query, ranked);
-        totalTokens += addStep(run, "synthesis",
-                "Synthesis with citations",
-                "Composed the final answer with inline citations to the selected sources.",
-                Map.of("sourceCount", sources.size()),
-                650);
-
-        totalCost = BigDecimal.valueOf(totalTokens)
-                .multiply(BigDecimal.valueOf(0.000004))
-                .setScale(4, RoundingMode.HALF_UP);
+        String summary = "Simulated synthesis on **" + query + "**. Enable a vLLM provider in "
+                + "Settings to produce a live, grounded answer with real tool calls.";
+        totalTokens += addStep(run, "synthesis", "Synthesis with citations",
+                "Composed a simulated answer.", Map.of("sourceCount", ranked.size()), 650);
 
         Map<String, Object> output = new LinkedHashMap<>();
         output.put("summary", summary);
         output.put("findings", ranked.stream().map(s -> s.get("title")).toList());
-        output.put("sources", sources);
+        output.put("sources", ranked);
+        finalize(run, output, totalTokens);
+    }
 
+    private List<Map<String, Object>> fakeSources(String subQuestion, int idx) {
+        List<Map<String, Object>> list = new ArrayList<>();
+        int n = 2 + ThreadLocalRandom.current().nextInt(2);
+        for (int i = 0; i < n; i++) {
+            Map<String, Object> s = new LinkedHashMap<>();
+            s.put("title", "Source " + (char) ('A' + idx) + (i + 1) + " — "
+                    + (subQuestion.length() > 48 ? subQuestion.substring(0, 45) + "..." : subQuestion));
+            s.put("url", "https://example.org/research/" + idx + "-" + i);
+            s.put("relevance", BigDecimal.valueOf(0.55 + ThreadLocalRandom.current().nextDouble() * 0.45)
+                    .setScale(2, RoundingMode.HALF_UP).doubleValue());
+            list.add(s);
+        }
+        return list;
+    }
+
+    // ------------------------------------------------------------- shared
+
+    private void finalize(Run run, Map<String, Object> output, int totalTokens) {
         run.setOutput(output);
         run.setTokens(totalTokens);
-        run.setCostUsd(totalCost);
+        run.setCostUsd(BigDecimal.valueOf(totalTokens).multiply(BigDecimal.valueOf(COST_PER_TOKEN))
+                .setScale(4, RoundingMode.HALF_UP));
         run.setStatus("completed");
         run.setEndedAt(Instant.now());
     }
@@ -113,57 +306,26 @@ public class FlowEngine {
         step.setDetail(detail);
         step.setPayload(new LinkedHashMap<>(payload));
         step.setTokens(tokens);
-        step.setCostUsd(BigDecimal.valueOf(tokens)
-                .multiply(BigDecimal.valueOf(0.000004))
+        step.setCostUsd(BigDecimal.valueOf(tokens).multiply(BigDecimal.valueOf(COST_PER_TOKEN))
                 .setScale(4, RoundingMode.HALF_UP));
         run.addStep(step);
         return tokens;
     }
 
-    private List<String> decompose(String query) {
-        return List.of(
-                "Background and current state of " + query,
-                "Key players and competitors related to " + query,
-                "Recent trends and signals around " + query,
-                "Risks, gaps and open questions about " + query);
+    private String inputText(Run run) {
+        try { return mapper.writeValueAsString(run.getInput()); }
+        catch (Exception e) { return String.valueOf(run.getInput()); }
     }
 
-    private List<Map<String, Object>> fakeSources(String subQuestion, int idx) {
-        List<Map<String, Object>> list = new ArrayList<>();
-        int n = 2 + ThreadLocalRandom.current().nextInt(2);
-        for (int i = 0; i < n; i++) {
-            Map<String, Object> s = new LinkedHashMap<>();
-            s.put("title", "Source " + (char) ('A' + idx) + (i + 1) + " — " + truncate(subQuestion));
-            s.put("url", "https://example.org/research/" + (idx) + "-" + i);
-            s.put("relevance", round(0.55 + ThreadLocalRandom.current().nextDouble() * 0.45));
-            list.add(s);
-        }
-        return list;
+    private int guardrailInt(Flow flow, String key, int def) {
+        Object g = flow.getConfig().get("guardrails");
+        if (g instanceof Map<?, ?> m && m.get(key) instanceof Number n) return n.intValue();
+        return def;
     }
 
-    private String synthesize(String query, List<Map<String, Object>> ranked) {
-        StringBuilder sb = new StringBuilder();
-        sb.append("Based on the agentic research across multiple sources, here is a synthesis on **")
-                .append(query).append("**.\n\n");
-        sb.append("The orchestrator dispatched parallel search subagents, triaged the candidate set, ")
-                .append("and the most relevant findings are summarized below");
-        if (!ranked.isEmpty()) {
-            sb.append(" with citations");
-            for (int i = 0; i < ranked.size(); i++) {
-                sb.append(" [").append(i + 1).append("]");
-            }
-        }
-        sb.append(".\n\nKey takeaways were extracted, deduplicated and ranked by relevance to give a ")
-                .append("concise, source-backed answer. This is a simulated run — connect a real LLM ")
-                .append("provider to produce live results.");
-        return sb.toString();
-    }
-
-    private String truncate(String s) {
-        return s.length() > 48 ? s.substring(0, 45) + "..." : s;
-    }
-
-    private double round(double v) {
-        return BigDecimal.valueOf(v).setScale(2, RoundingMode.HALF_UP).doubleValue();
+    private boolean guardrailBool(Flow flow) {
+        Object g = flow.getConfig().get("guardrails");
+        if (g instanceof Map<?, ?> m && m.get("require_citations") instanceof Boolean b) return b;
+        return true;
     }
 }
