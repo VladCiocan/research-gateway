@@ -12,6 +12,7 @@ import com.researchgateway.llm.LlmTypes.ChatResult;
 import com.researchgateway.llm.LlmTypes.ToolCall;
 import com.researchgateway.llm.LlmTypes.ToolDef;
 import com.researchgateway.repository.ProviderRepository;
+import com.researchgateway.service.RunStore;
 import org.springframework.stereotype.Component;
 
 import java.math.BigDecimal;
@@ -67,18 +68,20 @@ public class FlowEngine {
     private final LlmClient llmClient;
     private final JsFunctionRuntime js;
     private final McpConnector mcp;
+    private final RunStore store;
     private final ObjectMapper mapper = new ObjectMapper();
 
     public FlowEngine(ProviderRepository providerRepository, LlmClient llmClient,
-                      JsFunctionRuntime js, McpConnector mcp) {
+                      JsFunctionRuntime js, McpConnector mcp, RunStore store) {
         this.providerRepository = providerRepository;
         this.llmClient = llmClient;
         this.js = js;
         this.mcp = mcp;
+        this.store = store;
     }
 
     public void execute(Run run, Flow flow) {
-        run.setStatus("running");
+        store.markRunning(run.getId());
         Optional<Provider> provider = providerRepository.findFirstByEnabledTrueOrderByUpdatedAtDesc();
         if (provider.isPresent()) {
             runLive(run, flow, provider.get());
@@ -123,7 +126,7 @@ public class FlowEngine {
 
         addStep(ex, "synthesis", "Synthesis", "Final grounded answer composed by the orchestrator.",
                 Map.of("length", finalContent == null ? 0 : finalContent.length(),
-                        "toolIterations", ex.iterations.get()), 0);
+                        "toolIterations", ex.iterations.get()), 0, finalContent);
 
         Map<String, Object> output = new LinkedHashMap<>();
         output.put("summary", finalContent == null ? "" : finalContent);
@@ -197,7 +200,8 @@ public class FlowEngine {
         if (depth == 0) {
             addStep(ex, "tool_call", "Tool: " + name,
                     "Executed tool with model-provided arguments.",
-                    Map.of("name", name, "arguments", call.arguments(), "result", result), tokenShare);
+                    Map.of("name", name, "arguments", call.arguments(), "result", result), tokenShare,
+                    toJson(result));
         }
         return result;
     }
@@ -237,7 +241,7 @@ public class FlowEngine {
         addStep(ex, "skill", "Loaded skill: " + skill.getName(),
                 (first ? "Progressive disclosure — full instructions pulled in on demand"
                         : "Skill instructions re-read on demand") + " by " + agent.name + ".",
-                Map.of("skill", slug, "agent", agent.name, "instructions", instructions), 0);
+                Map.of("skill", slug, "agent", agent.name, "instructions", instructions), 0, instructions);
         return Map.of("ok", true, "skill", slug, "instructions", instructions);
     }
 
@@ -280,7 +284,7 @@ public class FlowEngine {
                             : "Completed its task (skill: " + (r.skill().isBlank() ? "—" : r.skill()) + ").",
                     Map.of("agent", r.agent(), "skill", r.skill(), "input", r.input(),
                             "answer", r.answer() == null ? "" : r.answer(), "toolActivity", r.activity()),
-                    r.tokens());
+                    r.tokens(), r.answer());
             Map<String, Object> entry = new LinkedHashMap<>();
             entry.put("agent", r.agent());
             entry.put("input", r.input());
@@ -575,7 +579,7 @@ public class FlowEngine {
         String summary = "Simulated synthesis on **" + query + "**. Enable a vLLM provider in "
                 + "Settings to produce a live, grounded answer with real tool calls.";
         addStep(ex, "synthesis", "Synthesis with citations",
-                "Composed a simulated answer.", Map.of("sourceCount", ranked.size()), 650);
+                "Composed a simulated answer.", Map.of("sourceCount", ranked.size()), 650, summary);
 
         Map<String, Object> output = new LinkedHashMap<>();
         output.put("summary", summary);
@@ -602,29 +606,37 @@ public class FlowEngine {
     // ------------------------------------------------------------- shared
 
     private void finalize(Run run, Map<String, Object> output, int totalTokens) {
-        run.setOutput(output);
-        run.setTokens(totalTokens);
-        run.setCostUsd(BigDecimal.valueOf(totalTokens).multiply(BigDecimal.valueOf(COST_PER_TOKEN))
-                .setScale(4, RoundingMode.HALF_UP));
-        run.setStatus("completed");
-        run.setEndedAt(Instant.now());
+        BigDecimal cost = BigDecimal.valueOf(totalTokens).multiply(BigDecimal.valueOf(COST_PER_TOKEN))
+                .setScale(4, RoundingMode.HALF_UP);
+        store.finish(run.getId(), output, totalTokens, cost);
     }
 
-    /** Append a trace step. Synchronized because parallel sub-agents may record concurrently. */
     private void addStep(Exec ex, String type, String title, String detail,
                          Map<String, Object> payload, int tokens) {
+        addStep(ex, type, title, detail, payload, tokens, null);
+    }
+
+    /**
+     * Append a trace step and commit it immediately so pollers see it live.
+     *
+     * @param raw the step's raw, unprocessed response (tool result, LLM output, sub-agent answer);
+     *            {@code null} for steps that produce none.
+     */
+    private void addStep(Exec ex, String type, String title, String detail,
+                         Map<String, Object> payload, int tokens, String raw) {
         RunStep step = new RunStep();
         step.setType(type);
         step.setTitle(title);
         step.setDetail(detail);
+        step.setRaw(raw);
         step.setPayload(new LinkedHashMap<>(payload));
         step.setTokens(tokens);
         step.setCostUsd(BigDecimal.valueOf(tokens).multiply(BigDecimal.valueOf(COST_PER_TOKEN))
                 .setScale(4, RoundingMode.HALF_UP));
         synchronized (ex.lock) {
             step.setSeq(ex.seq.incrementAndGet());
-            ex.run.addStep(step);
         }
+        store.saveStep(ex.runId, step);
     }
 
     private String inputText(Run run) {
@@ -679,6 +691,7 @@ public class FlowEngine {
     /** Per-execution context — keeps the engine bean stateless and thread-safe across runs. */
     private final class Exec {
         final Run run;
+        final java.util.UUID runId;
         final Flow flow;
         final Provider provider;
         final Map<String, SubagentDef> subagentDefs;
@@ -691,6 +704,7 @@ public class FlowEngine {
 
         Exec(Run run, Flow flow, Provider provider) {
             this.run = run;
+            this.runId = run.getId();
             this.flow = flow;
             this.provider = provider;
             this.subagentDefs = parseSubagentDefs(flow);

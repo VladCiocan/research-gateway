@@ -30,6 +30,7 @@ public record RunDto(
             String type,
             String title,
             String detail,
+            String raw,
             Map<String, Object> payload,
             Integer tokens,
             BigDecimal costUsd,
@@ -37,7 +38,7 @@ public record RunDto(
 
         static StepDto from(RunStep s) {
             return new StepDto(s.getId(), s.getSeq(), s.getType(), s.getTitle(),
-                    s.getDetail(), s.getPayload(), s.getTokens(), s.getCostUsd(), s.getCreatedAt());
+                    s.getDetail(), s.getRaw(), s.getPayload(), s.getTokens(), s.getCostUsd(), s.getCreatedAt());
         }
     }
 

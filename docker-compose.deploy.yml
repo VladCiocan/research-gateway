@@ -1,0 +1,55 @@
+# ============================================================
+# Research Gateway — deploy compose for the TARGET server.
+# Use this after `docker load -i research-gateway-<tag>.tar(.gz)`.
+# It does NOT build anything: it runs the pre-loaded image + Postgres.
+#
+#   docker load -i research-gateway-latest.tar.gz
+#   IMAGE_TAG=latest docker compose -f docker-compose.deploy.yml up -d
+# ============================================================
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: research-gateway-db
+    environment:
+      POSTGRES_DB: research_gateway
+      POSTGRES_USER: research
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-research}
+    ports:
+      # Expose Postgres to the host so you can connect remotely.
+      # Default binds to all interfaces; restrict it by setting e.g.
+      #   DB_BIND=127.0.0.1   (only reachable through an SSH tunnel)
+      - "${DB_BIND:-0.0.0.0}:${DB_PORT:-5432}:5432"
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U research -d research_gateway"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  app:
+    image: ${IMAGE_NAME:-research-gateway}:${IMAGE_TAG:-latest}
+    container_name: research-gateway-app
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DB_URL: jdbc:postgresql://db:5432/research_gateway
+      DB_USER: research
+      DB_PASSWORD: ${DB_PASSWORD:-research}
+      JAVA_OPTS: "-Xms256m -Xmx512m"
+    ports:
+      - "${APP_PORT:-8080}:8080"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/actuator/health | grep -q UP || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 40s
+
+volumes:
+  db-data:

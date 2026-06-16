@@ -33,6 +33,10 @@ public class RunStep {
     @Column(columnDefinition = "text")
     private String detail;
 
+    /** Raw, unprocessed response of this step (tool result JSON, LLM output, sub-agent answer, …). */
+    @Column(columnDefinition = "text")
+    private String raw;
+
     @JdbcTypeCode(SqlTypes.JSON)
     @Column(nullable = false, columnDefinition = "jsonb")
     private Map<String, Object> payload = new HashMap<>();
@@ -64,6 +68,8 @@ public class RunStep {
     public void setTitle(String title) { this.title = title; }
     public String getDetail() { return detail; }
     public void setDetail(String detail) { this.detail = detail; }
+    public String getRaw() { return raw; }
+    public void setRaw(String raw) { this.raw = raw; }
     public Map<String, Object> getPayload() { return payload; }
     public void setPayload(Map<String, Object> payload) { this.payload = payload; }
     public Integer getTokens() { return tokens; }

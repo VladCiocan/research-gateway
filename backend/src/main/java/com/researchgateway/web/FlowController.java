@@ -57,9 +57,17 @@ public class FlowController {
         return ResponseEntity.noContent().build();
     }
 
-    /** Dynamic, config-driven run endpoint: POST /api/flows/{slug}/run */
+    /**
+     * Dynamic, config-driven run endpoint: POST /api/flows/{slug}/run
+     *
+     * <p>By default this blocks until the run completes and returns the full result. Pass
+     * {@code ?async=true} to start the run on a background thread and get back the pending run
+     * immediately — then poll {@code GET /api/runs/{id}} to watch its trace update in real time.
+     */
     @PostMapping("/{slug}/run")
-    public RunDto run(@PathVariable String slug, @RequestBody(required = false) Map<String, Object> input) {
-        return runService.run(slug, input);
+    public RunDto run(@PathVariable String slug,
+                      @RequestParam(defaultValue = "false") boolean async,
+                      @RequestBody(required = false) Map<String, Object> input) {
+        return async ? runService.runAsync(slug, input) : runService.run(slug, input);
     }
 }
