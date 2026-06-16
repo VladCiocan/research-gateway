@@ -48,7 +48,8 @@ import { Capability, CapabilityType, Flow } from '../core/models';
             <label class="field" style="margin-top:14px"><span>Description</span>
               <input class="input" [(ngModel)]="description" /></label>
             <label class="field" style="margin-top:14px">
-              <span>Config (JSON) — models, guardrails, subagents, IO schema</span>
+              <span>Config (JSON) — models, guardrails, IO schema, and
+                <code class="mono">subagents.agents[]</code> (skill-defined: name / skill / when / capabilities)</span>
               <textarea class="textarea" rows="14" [(ngModel)]="configText"
                         [class.invalid]="!configValid()"></textarea>
             </label>

@@ -4,7 +4,7 @@ import com.researchgateway.domain.Capability;
 import com.researchgateway.dto.CapabilityDto;
 import com.researchgateway.dto.CapabilityRequest;
 import com.researchgateway.engine.McpConnector;
-import com.researchgateway.engine.functions.FunctionRegistry;
+import com.researchgateway.engine.js.JsFunctionRuntime;
 import com.researchgateway.repository.CapabilityRepository;
 import com.researchgateway.web.NotFoundException;
 import org.springframework.stereotype.Service;
@@ -20,13 +20,13 @@ import java.util.UUID;
 public class CapabilityService {
 
     private final CapabilityRepository repository;
-    private final FunctionRegistry functions;
+    private final JsFunctionRuntime js;
     private final McpConnector mcp;
 
     public CapabilityService(CapabilityRepository repository,
-                             FunctionRegistry functions, McpConnector mcp) {
+                             JsFunctionRuntime js, McpConnector mcp) {
         this.repository = repository;
-        this.functions = functions;
+        this.js = js;
         this.mcp = mcp;
     }
 
@@ -37,8 +37,8 @@ public class CapabilityService {
                 ? (Map<String, Object>) body.get("args")
                 : (body != null ? body : Map.of());
         try {
-            if ("function".equals(c.getType()) && functions.has(c.getSlug())) {
-                return Map.of("ok", true, "result", functions.get(c.getSlug()).execute(args));
+            if ("function".equals(c.getType()) && js.isExecutable(c.getSpec())) {
+                return Map.of("ok", true, "result", js.run(c.getSpec(), args));
             }
             if ("mcp".equals(c.getType()) && mcp.isBuiltin(c)) {
                 String op = body != null ? String.valueOf(body.getOrDefault("operation", "")) : "";
@@ -71,7 +71,7 @@ public class CapabilityService {
         c.setName(req.name());
         c.setSlug(uniqueSlug(req.slug(), req.name()));
         c.setDescription(req.description());
-        c.setSpec(req.spec() != null ? req.spec() : new HashMap<>());
+        c.setSpec(prepareSpec(req.type(), req.spec()));
         return CapabilityDto.from(repository.save(c));
     }
 
@@ -80,9 +80,18 @@ public class CapabilityService {
         c.setType(req.type());
         c.setName(req.name());
         c.setDescription(req.description());
-        if (req.spec() != null) c.setSpec(req.spec());
+        if (req.spec() != null) c.setSpec(prepareSpec(req.type(), req.spec()));
         c.setVersion(c.getVersion() + 1);
         return CapabilityDto.from(repository.save(c));
+    }
+
+    /** For JS/TS function specs, transpile any TypeScript and cache the JS so runs stay fast. */
+    private Map<String, Object> prepareSpec(String type, Map<String, Object> spec) {
+        Map<String, Object> s = spec != null ? spec : new HashMap<>();
+        if ("function".equals(type)) {
+            js.prepareForStorage(s);
+        }
+        return s;
     }
 
     public void delete(UUID id) {

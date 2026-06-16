@@ -40,7 +40,12 @@ RUN mvn -q -B -DskipTests package
 # ---- Stage 3: minimal runtime ----
 FROM eclipse-temurin:21-jre AS runtime
 WORKDIR /app
-RUN groupadd --system app && useradd --system --gid app app
+# Give the runtime user a writable home: GraalJS/Truffle unpacks internal resources under
+# $HOME when the engine is created, so it must exist and be writable by this user.
+RUN groupadd --system app \
+    && useradd --system --gid app --home-dir /home/app app \
+    && mkdir -p /home/app \
+    && chown -R app:app /home/app
 # Optionally trust custom CA certs at runtime (outbound HTTPS to MCP/LLM behind a proxy).
 COPY certs/ /tmp/certs/
 RUN if ls /tmp/certs/*.crt >/dev/null 2>&1; then \
@@ -53,5 +58,6 @@ RUN if ls /tmp/certs/*.crt >/dev/null 2>&1; then \
 COPY --from=backend /app/target/research-gateway.jar ./app.jar
 EXPOSE 8080
 USER app
+ENV HOME=/home/app
 ENV JAVA_OPTS=""
 ENTRYPOINT ["sh", "-c", "java $JAVA_OPTS -jar /app/app.jar"]

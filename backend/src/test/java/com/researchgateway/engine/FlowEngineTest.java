@@ -4,11 +4,7 @@ import com.researchgateway.domain.Capability;
 import com.researchgateway.domain.Flow;
 import com.researchgateway.domain.Provider;
 import com.researchgateway.domain.Run;
-import com.researchgateway.engine.functions.ConcatenateFunction;
-import com.researchgateway.engine.functions.DedupeFunction;
-import com.researchgateway.engine.functions.FunctionRegistry;
-import com.researchgateway.engine.functions.RankFunction;
-import com.researchgateway.engine.functions.ReadUrlFunction;
+import com.researchgateway.engine.js.JsFunctionRuntime;
 import com.researchgateway.llm.LlmClient;
 import com.researchgateway.llm.LlmTypes.ChatResult;
 import com.researchgateway.llm.LlmTypes.ToolCall;
@@ -28,11 +24,8 @@ import static org.mockito.Mockito.*;
 
 class FlowEngineTest {
 
-    private FunctionRegistry registry() {
-        return new FunctionRegistry(List.of(
-                new ConcatenateFunction(), new DedupeFunction(),
-                new RankFunction(), new ReadUrlFunction()));
-    }
+    /** Real GraalJS runtime, shared across tests (the Engine caches compiled sources). */
+    private static final JsFunctionRuntime JS = new JsFunctionRuntime();
 
     private Provider enabledProvider() {
         Provider p = new Provider();
@@ -44,11 +37,22 @@ class FlowEngineTest {
         return p;
     }
 
-    private Capability function(String slug, String name) {
+    /** A JavaScript "concatenate" function capability (replaces the old Java built-in). */
+    private Capability concatenateFn() {
         Capability fn = new Capability();
         fn.setType("function");
-        fn.setSlug(slug);
-        fn.setName(name);
+        fn.setSlug("concatenate");
+        fn.setName("Concatenate");
+        fn.setDescription("Join text fragments.");
+        fn.setSpec(Map.of(
+                "language", "javascript",
+                "code", "function handler(args){var items=Array.isArray(args.items)?args.items:[];"
+                        + "return {result: items.map(String).join(args.separator!=null?String(args.separator):'\\n'),"
+                        + " count: items.length};}",
+                "input_schema", Map.of("type", "object",
+                        "properties", Map.of("items", Map.of("type", "array",
+                                "items", Map.of("type", "string"))),
+                        "required", List.of("items"))));
         return fn;
     }
 
@@ -66,12 +70,12 @@ class FlowEngineTest {
         Flow flow = new Flow();
         flow.setName("Unit Flow");
         flow.setConfig(Map.of("guardrails", Map.of("max_iterations", 6)));
-        flow.setCapabilities(Set.of(function("concatenate", "Concatenate")));
+        flow.setCapabilities(Set.of(concatenateFn()));
         return flow;
     }
 
     private FlowEngine engine(ProviderRepository providers, LlmClient llm) {
-        return new FlowEngine(providers, llm, registry(), new McpConnector());
+        return new FlowEngine(providers, llm, JS, new McpConnector());
     }
 
     private ProviderRepository providersWithEnabled() {
@@ -172,14 +176,14 @@ class FlowEngineTest {
     }
 
     @Test
-    void spawnsParallelSubagentsThenSynthesizes() {
+    void spawnsDeclaredSubagentsThenSynthesizes() {
         ProviderRepository providers = providersWithEnabled();
 
         LlmClient llm = mock(LlmClient.class);
         when(llm.chat(any(), any(), any())).thenAnswer(inv -> {
             List<Map<String, Object>> messages = inv.getArgument(1);
             String system = String.valueOf(messages.get(0).get("content"));
-            if (system.contains("focused research sub-agent")) {
+            if (!system.contains("lead orchestrator")) {     // a sub-agent's own chat instance
                 return new ChatResult("Sub-agent finding.", List.of(), 9, 4);
             }
             boolean delegated = messages.stream().anyMatch(m -> "tool".equals(m.get("role")));
@@ -187,22 +191,36 @@ class FlowEngineTest {
                 return new ChatResult("Synthesized from sub-agents [1].", List.of(), 22, 7);
             }
             return new ChatResult("", List.of(new ToolCall("call_d", "spawn_subagents",
-                    Map.of("mode", "parallel",
-                            "tasks", List.of(Map.of("objective", "Task A"),
-                                    Map.of("objective", "Task B"))))), 14, 6);
+                    Map.of("mode", "parallel", "tasks", List.of(
+                            Map.of("agent", "researcher", "input", "Investigate A"),
+                            Map.of("agent", "sizer", "input", "Size B"))))), 14, 6);
         });
+
+        // The flow declares which sub-agents exist; each is defined by a skill with its own capabilities.
+        Flow flow = new Flow();
+        flow.setName("Delegation Flow");
+        flow.setConfig(Map.of("subagents", Map.of("agents", List.of(
+                Map.of("name", "researcher", "skill", "skill-research", "when", "investigate a question",
+                        "capabilities", List.of("concatenate")),
+                Map.of("name", "sizer", "skill", "skill-size", "when", "estimate size",
+                        "capabilities", List.of("concatenate"))))));
+        flow.setCapabilities(Set.of(concatenateFn(),
+                skill("skill-research", "Research", "always", "Gather and cross-check evidence."),
+                skill("skill-size", "Sizing", "always", "Estimate market size.")));
 
         Run run = new Run();
         run.setInput(Map.of("query", "delegate this"));
-        engine(providers, llm).execute(run, flowWithFunction());
+        engine(providers, llm).execute(run, flow);
 
         assertEquals("completed", run.getStatus());
         assertEquals("Synthesized from sub-agents [1].", run.getOutput().get("summary"));
 
         long subagentSteps = run.getSteps().stream().filter(s -> s.getType().equals("subagent")).count();
-        assertEquals(2, subagentSteps, "one trace step per delegated sub-agent");
+        assertEquals(2, subagentSteps, "one trace step per activated sub-agent");
         assertTrue(run.getSteps().stream()
                 .anyMatch(s -> s.getTitle().startsWith("Delegating to 2 sub-agent")));
+        assertTrue(run.getSteps().stream().anyMatch(s -> s.getType().equals("subagent")
+                && "researcher".equals(s.getPayload().get("agent"))), "sub-agent identified by name");
 
         // 2 orchestrator turns + 1 chat per sub-agent.
         verify(llm, times(4)).chat(any(), any(), any());
@@ -221,7 +239,7 @@ class FlowEngineTest {
         Flow flow = new Flow();
         flow.setName("Runaway Flow");
         flow.setConfig(Map.of("guardrails", Map.of("max_iterations", 500)));   // clamped to 120
-        flow.setCapabilities(Set.of(function("concatenate", "Concatenate")));
+        flow.setCapabilities(Set.of(concatenateFn()));
 
         Run run = new Run();
         run.setInput(Map.of("query", "loop"));

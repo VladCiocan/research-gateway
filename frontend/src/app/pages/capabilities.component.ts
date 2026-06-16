@@ -123,9 +123,24 @@ import { Capability, CapabilityHelp, CapabilityType } from '../core/models';
               <label class="field" style="margin-top:14px"><span>Spec (JSON)</span>
                 <textarea class="textarea" rows="8" [(ngModel)]="specText" [class.invalid]="!specValid()"></textarea></label>
             }
+          } @else if (form.type === 'function') {
+            <label class="field" style="margin-top:14px"><span>Language</span>
+              <select class="select" [(ngModel)]="form.language">
+                <option value="javascript">JavaScript</option>
+                <option value="typescript">TypeScript</option>
+              </select></label>
+            <label class="field" style="margin-top:14px">
+              <span>Code — define <code class="mono">function handler(args)</code> returning a JSON value</span>
+              <textarea class="textarea mono" rows="12" [(ngModel)]="codeText"
+                        placeholder="function handler(args) { return { ok: true }; }"></textarea>
+            </label>
+            @if (!codeText.trim()) { <small class="err">Function code is required.</small> }
+            <label class="field" style="margin-top:14px"><span>Input schema (JSON)</span>
+              <textarea class="textarea" rows="7" [(ngModel)]="schemaText" [class.invalid]="!schemaValid()"></textarea></label>
+            @if (!schemaValid()) { <small class="err">Invalid JSON.</small> }
           } @else {
             <label class="field" style="margin-top:14px">
-              <span>Spec (JSON) — {{ form.type === 'skill' ? 'instructions / resources' : form.type === 'function' ? 'input schema (mapped to a backend implementation by slug)' : 'input schema' }}</span>
+              <span>Spec (JSON) — {{ form.type === 'skill' ? 'instructions / resources' : 'definition' }}</span>
               <textarea class="textarea" rows="9" [(ngModel)]="specText" [class.invalid]="!specValid()"></textarea>
             </label>
             @if (!specValid()) { <small class="err">Invalid JSON.</small> }
@@ -223,10 +238,12 @@ export class CapabilitiesComponent implements OnInit {
   creating = signal(false);
   saving = signal(false);
 
-  form: { type: CapabilityType; name: string; description: string; kind: string; baseUrl: string; authHeader: string } =
-    { type: 'skill', name: '', description: '', kind: 'builtin', baseUrl: '', authHeader: '' };
+  form: { type: CapabilityType; name: string; description: string; kind: string; baseUrl: string; authHeader: string; language: string } =
+    { type: 'skill', name: '', description: '', kind: 'builtin', baseUrl: '', authHeader: '', language: 'javascript' };
   specText = '{}';
   operationsText = '[]';
+  codeText = '';
+  schemaText = '{}';
   testing = signal(false);
   testResult = signal('');
   testOperation = '';
@@ -234,6 +251,7 @@ export class CapabilitiesComponent implements OnInit {
 
   specValid = computed(() => { try { JSON.parse(this.specText); return true; } catch { return false; } });
   opsValid = computed(() => { try { return Array.isArray(JSON.parse(this.operationsText)); } catch { return false; } });
+  schemaValid = computed(() => { try { JSON.parse(this.schemaText); return true; } catch { return false; } });
   visible = computed(() => {
     const f = this.filter();
     return f ? this.items().filter((c) => c.type === f) : this.items();
@@ -269,6 +287,10 @@ export class CapabilitiesComponent implements OnInit {
         this.form.authHeader = (ex['auth_header'] as string) ?? '';
         this.operationsText = JSON.stringify(ex['operations'] ?? [], null, 2);
       }
+    } else if (this.form.type === 'function') {
+      this.form.language = (ex['language'] as string) || 'javascript';
+      this.codeText = (ex['code'] as string) ?? '';
+      this.schemaText = JSON.stringify(ex['input_schema'] ?? {}, null, 2);
     }
     this.specText = JSON.stringify(ex, null, 2);
   }
@@ -276,13 +298,16 @@ export class CapabilitiesComponent implements OnInit {
   canSave(): boolean {
     if (!this.form.name.trim()) return false;
     if (this.form.type === 'mcp' && this.form.kind === 'builtin') return this.opsValid();
+    if (this.form.type === 'function') return !!this.codeText.trim() && this.schemaValid();
     return this.specValid();
   }
 
   startNew(): void {
     this.editing.set(null); this.creating.set(true);
-    this.form = { type: 'skill', name: '', description: '', kind: 'builtin', baseUrl: '', authHeader: '' };
+    this.form = { type: 'skill', name: '', description: '', kind: 'builtin', baseUrl: '', authHeader: '', language: 'javascript' };
     this.specText = '{}';
+    this.codeText = 'function handler(args) {\n  return { ok: true };\n}';
+    this.schemaText = '{\n  "type": "object",\n  "properties": {},\n  "required": []\n}';
     this.operationsText = '[\n  {\n    "name": "example",\n    "method": "GET",\n    "path": "/resource/{id}",\n    "description": "Fetch a resource",\n    "params": { "id": "string (path)" }\n  }\n]';
   }
 
@@ -294,9 +319,12 @@ export class CapabilitiesComponent implements OnInit {
       kind: (spec['kind'] as string) || (c.type === 'mcp' ? 'external' : 'builtin'),
       baseUrl: (spec['base_url'] as string) ?? '',
       authHeader: (spec['auth_header'] as string) ?? '',
+      language: (spec['language'] as string) || 'javascript',
     };
     this.specText = JSON.stringify(spec, null, 2);
     this.operationsText = JSON.stringify(spec['operations'] ?? [], null, 2);
+    this.codeText = (spec['code'] as string) ?? '';
+    this.schemaText = JSON.stringify(spec['input_schema'] ?? {}, null, 2);
     this.testResult.set(''); this.testArgsText = '{}';
     const ops = spec['operations'] as Array<{ name?: string }> | undefined;
     this.testOperation = Array.isArray(ops) && ops.length ? (ops[0].name ?? '') : '';
@@ -311,6 +339,13 @@ export class CapabilitiesComponent implements OnInit {
         base_url: this.form.baseUrl,
         auth_header: this.form.authHeader,
         operations: JSON.parse(this.operationsText),
+      };
+    }
+    if (this.form.type === 'function') {
+      return {
+        language: this.form.language,
+        code: this.codeText,
+        input_schema: JSON.parse(this.schemaText),
       };
     }
     const base = JSON.parse(this.specText);

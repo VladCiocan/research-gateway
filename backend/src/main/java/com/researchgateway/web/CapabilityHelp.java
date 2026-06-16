@@ -41,24 +41,34 @@ public final class CapabilityHelp {
     }
 
     private static Map<String, Object> function() {
-        return guide("function", "Native function",
-                "Backend code that runs in-process — fast, deterministic, no external call. The slug must "
-                        + "match a registered BackendFunction bean (e.g. concatenate, dedupe_by_embedding, "
-                        + "rank_by_relevance, read_url_fn).",
-                "Pick a name and slug that map to an existing backend implementation, then describe the "
-                        + "arguments under spec.input_schema as JSON Schema. The orchestrator calls it like any "
-                        + "tool and may call it as many times as needed. Use the Test live panel to dry-run it.",
+        return guide("function", "Function (JavaScript / TypeScript)",
+                "Code you author in JavaScript or TypeScript, executed in-process by GraalJS in a sandboxed, "
+                        + "time-limited context. Fast and deterministic, with no host/file access beyond a small "
+                        + "HTTP bridge.",
+                "Write a top-level function handler(args) that takes the arguments object and returns a "
+                        + "JSON-serializable value. Set spec.language to \"javascript\" or \"typescript\" "
+                        + "(TypeScript is transpiled to JS on save — types are stripped, not type-checked), put the "
+                        + "source in spec.code, and describe the arguments under spec.input_schema as JSON Schema. "
+                        + "Functions may fetch remote content via the provided httpGet(url) / "
+                        + "httpRequest(method, url, body) bridge. Call it from a flow like any tool; use the "
+                        + "Test live panel to dry-run it.",
                 List.of(
-                        field("runtime", false, "Informational — always \"backend\" for native functions."),
-                        field("input_schema", true, "JSON Schema (type/properties/required) describing the arguments.")),
-                map("runtime", "backend",
+                        field("language", false, "\"javascript\" (default) or \"typescript\"."),
+                        field("code", true, "Source defining function handler(args) that returns the result."),
+                        field("input_schema", true, "JSON Schema (type/properties/required) describing the arguments."),
+                        field("timeout_ms", false, "Per-call wall-clock limit. Default 5000, max 30000.")),
+                map("language", "typescript",
+                        "code", "interface Args { text: string }\n"
+                                + "function handler(args: Args) {\n"
+                                + "  return { upper: String(args.text || '').toUpperCase() };\n"
+                                + "}",
                         "input_schema", map("type", "object",
-                                "properties", map("items", map("type", "array", "items", map("type", "string")),
-                                        "separator", map("type", "string")),
-                                "required", List.of("items"))),
-                List.of("The slug is the contract: only slugs backed by a bean execute live.",
-                        "Return JSON-serializable values; errors should be returned as {\"error\": \"...\"}.",
-                        "Prefer functions over MCP for pure, side-effect-free transforms."));
+                                "properties", map("text", map("type", "string")),
+                                "required", List.of("text"))),
+                List.of("Define exactly one top-level function handler(args); return JSON-serializable data.",
+                        "Return errors as { \"error\": \"...\" } rather than throwing.",
+                        "Only httpGet/httpRequest reach the network — there is no other host, file or thread access.",
+                        "Functions share the flow's 120 tool-iteration budget, so keep them focused and fast."));
     }
 
     private static Map<String, Object> tool() {

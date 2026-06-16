@@ -13,9 +13,12 @@ This repository ships a working MVP of the architecture described in
   provider with tool calling. Within one flow session it can: call functions and **builtin MCP
   operations repeatedly** (with **pagination** metadata to walk result pages); **load skills on
   demand** (progressive disclosure — a flow can carry many skills yet pull in only what it needs);
-  and **delegate to parallel or chained sub-agents**. All tool activity shares a single hard budget
-  of **120 tool iterations** per session, and every step is captured in a full, auditable trace.
-  With no provider enabled it falls back to a deterministic simulation so the app still demos.
+  and **delegate to declared sub-agents** (parallel or chained). Each sub-agent is **defined by a
+  skill**, runs as its own chat instance with its own context and its own assigned skills/functions/
+  MCPs, and returns its result to the orchestrator — the flow config names which sub-agents exist and
+  when to activate them. All tool activity shares a single hard budget of **120 tool iterations** per
+  session, and every step is captured in a full, auditable trace. With no provider enabled it falls
+  back to a deterministic simulation so the app still demos.
 - **Packaging** — the Angular app is built and served as static resources by the Spring
   Boot backend, so **everything runs from a single Docker image**, orchestrated with
   Docker Compose alongside Postgres.
@@ -80,8 +83,10 @@ npm start        # http://localhost:4200
   `always` skills are injected up front; `on-demand` skills are only advertised and pulled in
   live via the `load_skill` tool when the task needs them — so a flow can carry many skills yet
   load only the few it uses on a given run, and re-load any of them as often as needed.
-- **Functions** — native backend code, runnable live: `concatenate`, `dedupe_by_embedding`,
-  `rank_by_relevance`, `read_url_fn`.
+- **Functions** — **JavaScript / TypeScript** you author in the registry, executed in-process by a
+  sandboxed GraalJS runtime (define `function handler(args)`; TypeScript is transpiled to JS on save).
+  A small `httpGet` / `httpRequest` bridge is the only host access, and each call is time-limited.
+  Seeded examples: `concatenate`, `dedupe_by_embedding`, `rank_by_relevance`, `read_url_fn`.
 - **MCP servers** — two kinds: **external** (a real MCP server) and **builtin** (an in-platform
   REST integration you configure with base URL, auth header and operations — each operation
   becomes a callable tool). Mark an operation `paginated: true` to get `pageInfo` (`hasMore` plus
@@ -107,10 +112,26 @@ npm start        # http://localhost:4200
   into `src/main/resources/static` during the Docker build (stage 2), so a single Spring
   Boot process serves both the SPA and the REST API. Client-side routes are forwarded to
   `index.html` by `SpaForwardController`.
-- Schema is managed by Flyway (`backend/src/main/resources/db/migration`).
-- The current engine is a deterministic **simulation** — no live LLM calls — so the whole
-  product is functional offline. Wire a real provider into `FlowEngine` to produce live
-  results.
+- Schema is managed by Flyway (`backend/src/main/resources/db/migration`), including a Java
+  migration (`db/migration/V5__migrate_functions_to_js.java`).
+- `FlowEngine` runs a live orchestrator loop when a provider is enabled (on-demand skills,
+  declared sub-agents, a shared 120 tool-iteration budget) and falls back to a deterministic
+  **simulation** with no provider, so the product is fully functional offline.
+- Function capabilities are JavaScript/TypeScript executed by GraalJS (`JsFunctionRuntime`);
+  the bundled TypeScript compiler (`resources/js/typescript.js`) transpiles TS on save.
+- **Sub-agents** are declared in a flow's `config.subagents.agents[]`. Each is defined by a skill
+  and assigned its own subset of the flow's capabilities; the orchestrator activates them by name:
+
+  ```json
+  "subagents": {
+    "max_concurrent": 4,
+    "agents": [
+      { "name": "market-sizer", "skill": "sizing-and-tam",
+        "when": "estimate market size from gathered evidence",
+        "capabilities": ["numeric-reconciliation", "concatenate"] }
+    ]
+  }
+  ```
 
 ## Configuration
 

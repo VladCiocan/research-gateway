@@ -6,8 +6,7 @@ import com.researchgateway.domain.Flow;
 import com.researchgateway.domain.Provider;
 import com.researchgateway.domain.Run;
 import com.researchgateway.domain.RunStep;
-import com.researchgateway.engine.functions.BackendFunction;
-import com.researchgateway.engine.functions.FunctionRegistry;
+import com.researchgateway.engine.js.JsFunctionRuntime;
 import com.researchgateway.llm.LlmClient;
 import com.researchgateway.llm.LlmTypes.ChatResult;
 import com.researchgateway.llm.LlmTypes.ToolCall;
@@ -19,6 +18,7 @@ import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -38,13 +38,14 @@ import java.util.concurrent.atomic.AtomicInteger;
  * OpenAI-compatible (vLLM) endpoint with tool calling. Within a single flow session the
  * orchestrator may:
  * <ul>
- *   <li>call native functions and builtin MCP operations <b>repeatedly</b> (MCP operations
+ *   <li>call native JS/TS functions and builtin MCP operations <b>repeatedly</b> (MCP operations
  *       expose pagination metadata so the model can walk through pages);</li>
- *   <li><b>load skills on demand</b> via the synthetic {@code load_skill} tool — a flow can be
- *       assigned many skills yet only pull in the instructions it actually needs
- *       (progressive disclosure);</li>
- *   <li><b>delegate</b> to parallel or chained sub-agents via the synthetic
- *       {@code spawn_subagents} tool.</li>
+ *   <li><b>load skills on demand</b> via the synthetic {@code load_skill} tool (progressive
+ *       disclosure);</li>
+ *   <li><b>delegate</b> to <b>declared sub-agents</b> via the synthetic {@code spawn_subagents}
+ *       tool. Each sub-agent is defined by a skill and runs as its own chat instance with its own
+ *       context and its own assigned skills / functions / MCPs; its result is returned to the
+ *       orchestrator. The flow config names which sub-agents exist and when to activate them.</li>
  * </ul>
  * All tool activity — the orchestrator's plus every sub-agent's — shares a single hard budget
  * of {@value #MAX_TOOL_ITERATIONS} tool iterations per flow session. With no provider configured
@@ -64,15 +65,15 @@ public class FlowEngine {
 
     private final ProviderRepository providerRepository;
     private final LlmClient llmClient;
-    private final FunctionRegistry functions;
+    private final JsFunctionRuntime js;
     private final McpConnector mcp;
     private final ObjectMapper mapper = new ObjectMapper();
 
     public FlowEngine(ProviderRepository providerRepository, LlmClient llmClient,
-                      FunctionRegistry functions, McpConnector mcp) {
+                      JsFunctionRuntime js, McpConnector mcp) {
         this.providerRepository = providerRepository;
         this.llmClient = llmClient;
-        this.functions = functions;
+        this.js = js;
         this.mcp = mcp;
     }
 
@@ -90,25 +91,27 @@ public class FlowEngine {
 
     private void runLive(Run run, Flow flow, Provider provider) {
         Exec ex = new Exec(run, flow, provider);
+        Agent orch = ex.orchestrator;
         String query = inputText(run);
         int orchestratorLoops = clamp(guardrailInt(flow, "max_iterations", MAX_TOOL_ITERATIONS), 1, MAX_TOOL_ITERATIONS);
 
-        List<ToolDef> tools = ex.orchestratorTools;
         List<Map<String, Object>> messages = new ArrayList<>();
         messages.add(message("system", orchestratorPrompt(ex)));
         messages.add(message("user",
                 "Request input (JSON):\n" + query + "\n\nProduce the requested research output."));
 
         addStep(ex, "plan", "Orchestrator initialized",
-                "Loaded provider '" + provider.getModel() + "', " + tools.size()
-                        + " tool(s), " + ex.alwaysSkills.size() + " always-on skill(s) and "
-                        + ex.onDemandSkills.size() + " skill(s) loadable on demand.",
+                "Loaded provider '" + provider.getModel() + "', " + orch.tools.size()
+                        + " tool(s), " + orch.alwaysSkills.size() + " always-on skill(s), "
+                        + orch.onDemandSkills.size() + " on-demand skill(s) and "
+                        + ex.subagentDefs.size() + " declared sub-agent(s).",
                 Map.of("model", provider.getModel(),
-                        "tools", tools.stream().map(ToolDef::name).toList(),
-                        "skillsOnDemand", new ArrayList<>(ex.onDemandSkills.keySet()),
+                        "tools", orch.tools.stream().map(ToolDef::name).toList(),
+                        "skillsOnDemand", new ArrayList<>(orch.onDemandSkills.keySet()),
+                        "subagents", new ArrayList<>(ex.subagentDefs.keySet()),
                         "iterationBudget", MAX_TOOL_ITERATIONS), 0);
 
-        LoopOut out = runLoop(ex, messages, tools, orchestratorLoops, 0, null);
+        LoopOut out = runLoop(ex, orch, messages, orchestratorLoops, 0, null);
         String finalContent = out.content();
 
         // Force a final answer if the loop ended still wanting tools or hit the budget.
@@ -133,18 +136,19 @@ public class FlowEngine {
      * The orchestrator/sub-agent loop: chat, run any requested tools, repeat until the model
      * answers, the local loop bound is reached, or the shared iteration budget is exhausted.
      *
+     * @param agent the acting agent (its tools, skills and functions/MCPs).
      * @param depth 0 for the lead orchestrator, &ge;1 for sub-agents.
      * @param sink  when non-null (sub-agents), each tool call is appended here instead of being
      *              recorded as a top-level trace step.
      */
-    private LoopOut runLoop(Exec ex, List<Map<String, Object>> messages, List<ToolDef> tools,
+    private LoopOut runLoop(Exec ex, Agent agent, List<Map<String, Object>> messages,
                             int maxLoops, int depth, List<Map<String, Object>> sink) {
         String finalContent = null;
         int localTokens = 0;
         for (int i = 0; i < maxLoops; i++) {
             if (ex.iterations.get() >= MAX_TOOL_ITERATIONS) break;   // shared hard budget exhausted
 
-            ChatResult res = llmClient.chat(ex.provider, messages, tools);
+            ChatResult res = llmClient.chat(ex.provider, messages, agent.tools);
             ex.tokens.addAndGet(res.totalTokens());
             localTokens += res.totalTokens();
 
@@ -161,7 +165,7 @@ public class FlowEngine {
             messages.add(assistantWithToolCalls(res));
             int share = res.totalTokens() / Math.max(1, res.toolCalls().size());
             for (ToolCall call : res.toolCalls()) {
-                Object result = executeCall(ex, call, depth, share);
+                Object result = executeCall(ex, agent, call, depth, share);
                 if (sink != null) {
                     Map<String, Object> act = new LinkedHashMap<>();
                     act.put("name", call.name());
@@ -176,11 +180,11 @@ public class FlowEngine {
     }
 
     /** Run a single tool call, routing synthetic tools and recording the appropriate trace step. */
-    private Object executeCall(Exec ex, ToolCall call, int depth, int tokenShare) {
+    private Object executeCall(Exec ex, Agent agent, ToolCall call, int depth, int tokenShare) {
         String name = call.name();
 
         if (LOAD_SKILL.equals(name)) {
-            return loadSkill(ex, call.arguments());
+            return loadSkill(ex, agent, call.arguments());
         }
         if (SPAWN_SUBAGENTS.equals(name)) {
             if (depth > 0) {
@@ -189,7 +193,7 @@ public class FlowEngine {
             return spawnSubagents(ex, call.arguments());
         }
 
-        Object result = dispatchTool(ex, name, call.arguments());
+        Object result = dispatchTool(ex, agent, name, call.arguments());
         if (depth == 0) {
             addStep(ex, "tool_call", "Tool: " + name,
                     "Executed tool with model-provided arguments.",
@@ -198,11 +202,12 @@ public class FlowEngine {
         return result;
     }
 
-    /** Dispatch a native function or a builtin MCP operation. */
-    private Object dispatchTool(Exec ex, String name, Map<String, Object> args) {
-        if (functions.has(name)) {
+    /** Dispatch a JS/TS function or a builtin MCP operation — restricted to the agent's assigned set. */
+    private Object dispatchTool(Exec ex, Agent agent, String name, Map<String, Object> args) {
+        Capability fn = agent.functionsBySlug.get(name);
+        if (fn != null) {
             try {
-                return functions.get(name).execute(args);
+                return js.run(fn.getSpec(), args);
             } catch (Exception exn) {
                 return Map.of("error", exn.getMessage());
             }
@@ -210,57 +215,59 @@ public class FlowEngine {
         if (name.contains(McpConnector.SEP)) {
             String slug = name.substring(0, name.indexOf(McpConnector.SEP));
             String op = name.substring(name.indexOf(McpConnector.SEP) + McpConnector.SEP.length());
-            for (Capability c : ex.flow.getCapabilities()) {
-                if ("mcp".equals(c.getType()) && c.getSlug().equals(slug) && mcp.isBuiltin(c)) {
-                    return mcp.execute(c, op, args);
-                }
+            Capability m = agent.mcpBySlug.get(slug);
+            if (m != null) {
+                return mcp.execute(m, op, args);
             }
         }
-        return Map.of("error", "Tool '" + name + "' is not available live (external/unconfigured).");
+        return Map.of("error", "Tool '" + name + "' is not assigned to this agent or not available live.");
     }
 
     // ---------------------------------------------------------------- skills (progressive disclosure)
 
-    private Object loadSkill(Exec ex, Map<String, Object> args) {
+    private Object loadSkill(Exec ex, Agent agent, Map<String, Object> args) {
         String slug = String.valueOf(args.getOrDefault("skill", "")).trim();
-        Capability skill = ex.onDemandSkills.get(slug);
+        Capability skill = agent.onDemandSkills.get(slug);
         if (skill == null) {
             return Map.of("error", "Unknown on-demand skill: '" + slug + "'.",
-                    "available", new ArrayList<>(ex.onDemandSkills.keySet()));
+                    "available", new ArrayList<>(agent.onDemandSkills.keySet()));
         }
         String instructions = skillInstructions(skill);
-        boolean first = ex.loadedSkills.add(slug);
+        boolean first = ex.loadedSkills.add(agent.name + "/" + slug);
         addStep(ex, "skill", "Loaded skill: " + skill.getName(),
-                first ? "Progressive disclosure — full instructions pulled in on demand."
-                        : "Skill instructions re-read on demand.",
-                Map.of("skill", slug, "instructions", instructions), 0);
+                (first ? "Progressive disclosure — full instructions pulled in on demand"
+                        : "Skill instructions re-read on demand") + " by " + agent.name + ".",
+                Map.of("skill", slug, "agent", agent.name, "instructions", instructions), 0);
         return Map.of("ok", true, "skill", slug, "instructions", instructions);
     }
 
-    // ---------------------------------------------------------------- sub-agents (parallel / chained)
+    // ---------------------------------------------------------------- sub-agents (declared, skill-defined)
 
     @SuppressWarnings("unchecked")
     private Object spawnSubagents(Exec ex, Map<String, Object> args) {
+        if (ex.subagentDefs.isEmpty()) {
+            return Map.of("error", "This flow declares no sub-agents.");
+        }
         String mode = "chained".equalsIgnoreCase(String.valueOf(args.get("mode"))) ? "chained" : "parallel";
         List<Map<String, Object>> tasks = new ArrayList<>();
         if (args.get("tasks") instanceof List<?> list) {
             for (Object o : list) {
-                if (o instanceof Map<?, ?> m && m.get("objective") != null) {
+                if (o instanceof Map<?, ?> m && m.get("agent") != null) {
                     tasks.add((Map<String, Object>) m);
                 }
             }
         }
         if (tasks.isEmpty()) {
-            return Map.of("error", "Provide at least one task with an 'objective'.");
+            return Map.of("error", "Provide at least one task with an 'agent' and 'input'.",
+                    "available", new ArrayList<>(ex.subagentDefs.keySet()));
         }
         if (tasks.size() > 8) tasks = tasks.subList(0, 8);   // keep delegation bounded
 
         addStep(ex, "plan", "Delegating to " + tasks.size() + " sub-agent(s) [" + mode + "]",
                 mode.equals("parallel")
-                        ? "Running independent sub-agents concurrently."
-                        : "Running sub-agents sequentially, each building on the previous.",
-                Map.of("mode", mode, "objectives",
-                        tasks.stream().map(t -> String.valueOf(t.get("objective"))).toList()), 0);
+                        ? "Activating declared sub-agents concurrently."
+                        : "Activating declared sub-agents sequentially, each building on the previous.",
+                Map.of("mode", mode, "agents", tasks.stream().map(t -> taskField(t, "agent")).toList()), 0);
 
         List<SubResult> results = mode.equals("chained")
                 ? runChained(ex, tasks)
@@ -268,12 +275,15 @@ public class FlowEngine {
 
         List<Map<String, Object>> summary = new ArrayList<>();
         for (SubResult r : results) {
-            addStep(ex, "subagent", "Sub-agent: " + truncate(r.objective(), 70),
-                    r.skipped() ? "Skipped — iteration budget exhausted." : "Completed delegated objective.",
-                    Map.of("objective", r.objective(), "answer", r.answer() == null ? "" : r.answer(),
-                            "toolActivity", r.activity()), r.tokens());
+            addStep(ex, "subagent", "Sub-agent: " + r.agent(),
+                    r.skipped() ? "Skipped — iteration budget exhausted or unknown agent."
+                            : "Completed its task (skill: " + (r.skill().isBlank() ? "—" : r.skill()) + ").",
+                    Map.of("agent", r.agent(), "skill", r.skill(), "input", r.input(),
+                            "answer", r.answer() == null ? "" : r.answer(), "toolActivity", r.activity()),
+                    r.tokens());
             Map<String, Object> entry = new LinkedHashMap<>();
-            entry.put("objective", r.objective());
+            entry.put("agent", r.agent());
+            entry.put("input", r.input());
             entry.put("answer", r.answer() == null ? "" : r.answer());
             entry.put("skipped", r.skipped());
             summary.add(entry);
@@ -286,7 +296,7 @@ public class FlowEngine {
         String upstream = null;
         for (Map<String, Object> task : tasks) {
             if (ex.iterations.get() >= MAX_TOOL_ITERATIONS) {
-                results.add(SubResult.skipped(String.valueOf(task.get("objective"))));
+                results.add(SubResult.skipped(task));
                 continue;
             }
             SubResult r = runSubagent(ex, task, upstream);
@@ -303,7 +313,7 @@ public class FlowEngine {
             List<Future<SubResult>> futures = new ArrayList<>();
             for (Map<String, Object> task : tasks) {
                 Callable<SubResult> job = () -> ex.iterations.get() >= MAX_TOOL_ITERATIONS
-                        ? SubResult.skipped(String.valueOf(task.get("objective")))
+                        ? SubResult.skipped(task)
                         : runSubagent(ex, task, null);
                 futures.add(executor.submit(job));
             }
@@ -312,7 +322,8 @@ public class FlowEngine {
                 try {
                     results.add(futures.get(i).get());
                 } catch (Exception e) {
-                    results.add(new SubResult(String.valueOf(tasks.get(i).get("objective")),
+                    Map<String, Object> task = tasks.get(i);
+                    results.add(new SubResult(taskField(task, "agent"), taskField(task, "input"), "",
                             "Sub-agent failed: " + e.getMessage(), List.of(), 0, false));
                 }
             }
@@ -322,23 +333,30 @@ public class FlowEngine {
         }
     }
 
+    /** Run one declared sub-agent as its own chat instance with its own context and tools. */
     private SubResult runSubagent(Exec ex, Map<String, Object> task, String upstream) {
-        String objective = String.valueOf(task.get("objective"));
-        String context = String.valueOf(task.getOrDefault("context", ""));
+        String agentName = taskField(task, "agent");
+        String input = taskField(task, "input");
+        SubagentDef def = ex.subagentDefs.get(agentName);
+        if (def == null) {
+            return new SubResult(agentName, input, "",
+                    "Unknown sub-agent '" + agentName + "'. Available: " + ex.subagentDefs.keySet(),
+                    List.of(), 0, true);
+        }
+        Agent agent = ex.subagentAgent(def);
         int workerLoops = clamp(subagentsInt(ex.flow, "max_loops", 8), 1, MAX_TOOL_ITERATIONS);
 
         List<Map<String, Object>> messages = new ArrayList<>();
-        messages.add(message("system", subagentPrompt(ex)));
-        StringBuilder user = new StringBuilder("Objective:\n").append(objective);
-        if (!context.isBlank()) user.append("\n\nContext:\n").append(context);
+        messages.add(message("system", subagentPrompt(ex, def, agent)));
+        StringBuilder user = new StringBuilder("Your task:\n").append(input.isBlank() ? "(no input given)" : input);
         if (upstream != null && !upstream.isBlank()) {
             user.append("\n\nUpstream sub-agent result to build on:\n").append(upstream);
         }
-        user.append("\n\nComplete the objective, then return your result with no further tool calls.");
+        user.append("\n\nComplete the task, then return your result with no further tool calls.");
         messages.add(message("user", user.toString()));
 
         List<Map<String, Object>> activity = new ArrayList<>();
-        LoopOut out = runLoop(ex, messages, ex.workerTools, workerLoops, 1, activity);
+        LoopOut out = runLoop(ex, agent, messages, workerLoops, 1, activity);
         String answer = out.content();
         int tokens = out.tokens();
         if (answer == null) {   // force a final answer from the sub-agent
@@ -347,12 +365,13 @@ public class FlowEngine {
             tokens += res.totalTokens();
             answer = res.content();
         }
-        return new SubResult(objective, answer, activity, tokens, false);
+        return new SubResult(agentName, input, def.skillSlug(), answer, activity, tokens, false);
     }
 
     // ---------------------------------------------------------------- prompts
 
     private String orchestratorPrompt(Exec ex) {
+        Agent orch = ex.orchestrator;
         StringBuilder sb = new StringBuilder();
         sb.append("You are the lead orchestrator for the research flow \"")
                 .append(ex.flow.getName()).append("\".\n");
@@ -367,52 +386,62 @@ public class FlowEngine {
         }
         sb.append("When you have enough information, write the final answer with no further tool calls.\n");
         sb.append("You may make up to ").append(MAX_TOOL_ITERATIONS)
-                .append(" tool iterations in this session (shared with any sub-agents you spawn).\n");
+                .append(" tool iterations in this session (shared with any sub-agents you activate).\n");
 
-        appendAlwaysSkills(sb, ex);
-        appendOnDemandSkills(sb, ex);
-
-        sb.append("\nDelegation: call ").append(SPAWN_SUBAGENTS)
-                .append(" with several focused tasks to fan work out. Use mode \"parallel\" for ")
-                .append("independent sub-questions, or \"chained\" when each step must build on the previous. ")
-                .append("Sub-agents share the same tools and the session iteration budget.\n");
-
-        appendToolList(sb, ex.orchestratorTools);
+        appendAlwaysSkills(sb, orch);
+        appendOnDemandSkills(sb, orch);
+        appendSubagents(sb, ex);
+        appendToolList(sb, orch.tools);
         return sb.toString();
     }
 
-    private String subagentPrompt(Exec ex) {
+    private String subagentPrompt(Exec ex, SubagentDef def, Agent agent) {
         StringBuilder sb = new StringBuilder();
-        sb.append("You are a focused research sub-agent working for the flow \"")
+        sb.append("You are the \"").append(def.name()).append("\" sub-agent for the flow \"")
                 .append(ex.flow.getName()).append("\".\n");
-        sb.append("Complete the single objective you are given using the available tools. ");
-        sb.append("Call tools as many times as needed (including for pagination). ");
+        sb.append("You are a fresh chat instance with your own context. Complete the single task you are ")
+                .append("given using your own assigned tools and skills. Call tools as many times as needed ")
+                .append("(including for pagination). ");
         if (guardrailBool(ex.flow)) {
             sb.append("Preserve source attribution so the lead can cite it. ");
         }
         sb.append("Return a concise, evidence-backed result; do not spawn further sub-agents.\n");
-        appendAlwaysSkills(sb, ex);
-        appendOnDemandSkills(sb, ex);
-        appendToolList(sb, ex.workerTools);
+        appendAlwaysSkills(sb, agent);
+        appendOnDemandSkills(sb, agent);
+        appendToolList(sb, agent.tools);
         return sb.toString();
     }
 
-    private void appendAlwaysSkills(StringBuilder sb, Exec ex) {
-        if (ex.alwaysSkills.isEmpty()) return;
+    private void appendAlwaysSkills(StringBuilder sb, Agent agent) {
+        if (agent.alwaysSkills.isEmpty()) return;
         sb.append("\nActivated skills:\n");
-        for (Capability s : ex.alwaysSkills) {
+        for (Capability s : agent.alwaysSkills) {
             sb.append("## ").append(s.getName()).append("\n").append(skillInstructions(s)).append("\n");
         }
     }
 
-    private void appendOnDemandSkills(StringBuilder sb, Exec ex) {
-        if (ex.onDemandSkills.isEmpty()) return;
+    private void appendOnDemandSkills(StringBuilder sb, Agent agent) {
+        if (agent.onDemandSkills.isEmpty()) return;
         sb.append("\nSkills available to load on demand (call ").append(LOAD_SKILL)
                 .append(" with the slug to pull in full instructions — only when the task needs it):\n");
-        for (Map.Entry<String, Capability> e : ex.onDemandSkills.entrySet()) {
+        for (Map.Entry<String, Capability> e : agent.onDemandSkills.entrySet()) {
             sb.append("- ").append(e.getKey()).append(": ")
                     .append(e.getValue().getDescription() == null ? "" : e.getValue().getDescription())
                     .append("\n");
+        }
+    }
+
+    private void appendSubagents(StringBuilder sb, Exec ex) {
+        if (ex.subagentDefs.isEmpty()) return;
+        sb.append("\nDeclared sub-agents — delegate by calling ").append(SPAWN_SUBAGENTS)
+                .append(" with the agent name and a specific input. Each runs as its own chat instance with ")
+                .append("its own context and tools, and returns its result to you. Use mode \"parallel\" for ")
+                .append("independent activations, \"chained\" when one builds on another:\n");
+        for (SubagentDef d : ex.subagentDefs.values()) {
+            sb.append("- ").append(d.name());
+            if (!d.skillSlug().isBlank()) sb.append(" (skill: ").append(d.skillSlug()).append(")");
+            if (!d.when().isBlank()) sb.append(" — use when: ").append(d.when());
+            sb.append("\n");
         }
     }
 
@@ -429,17 +458,13 @@ public class FlowEngine {
 
     // ---------------------------------------------------------------- tool wiring
 
-    private List<ToolDef> capabilityTools(Flow flow) {
-        List<ToolDef> tools = new ArrayList<>();
-        for (Capability c : flow.getCapabilities()) {
-            if ("function".equals(c.getType()) && functions.has(c.getSlug())) {
-                BackendFunction fn = functions.get(c.getSlug());
-                tools.add(new ToolDef(fn.slug(), fn.description(), fn.inputSchema()));
-            } else if ("mcp".equals(c.getType()) && mcp.isBuiltin(c)) {
-                tools.addAll(mcp.toolDefs(c));
-            }
-        }
-        return tools;
+    @SuppressWarnings("unchecked")
+    private ToolDef functionToolDef(Capability c) {
+        Object schema = c.getSpec().get("input_schema");
+        Map<String, Object> params = schema instanceof Map
+                ? (Map<String, Object>) schema
+                : Map.of("type", "object", "properties", Map.of());
+        return new ToolDef(c.getSlug(), c.getDescription() == null ? "" : c.getDescription(), params);
     }
 
     private ToolDef loadSkillTool(Map<String, Capability> onDemand) {
@@ -454,19 +479,24 @@ public class FlowEngine {
                         + "May be called multiple times.", schema);
     }
 
-    private ToolDef spawnSubagentsTool() {
+    private ToolDef spawnSubagentsTool(Collection<String> agentNames) {
         Map<String, Object> mode = Map.of("type", "string", "enum", List.of("parallel", "chained"),
                 "description", "parallel = independent concurrent sub-agents; chained = each builds on the previous.");
+        Map<String, Object> agentProp = new LinkedHashMap<>();
+        agentProp.put("type", "string");
+        agentProp.put("enum", new ArrayList<>(agentNames));
+        agentProp.put("description", "Name of the declared sub-agent to activate.");
         Map<String, Object> taskItem = Map.of("type", "object", "properties", Map.of(
-                "objective", Map.of("type", "string", "description", "What this sub-agent must accomplish."),
-                "context", Map.of("type", "string", "description", "Optional context to seed the sub-agent.")),
-                "required", List.of("objective"));
+                "agent", agentProp,
+                "input", Map.of("type", "string", "description", "The specific task/question for this sub-agent.")),
+                "required", List.of("agent", "input"));
         Map<String, Object> tasks = Map.of("type", "array",
-                "description", "1-8 focused sub-agent tasks.", "items", taskItem);
+                "description", "1-8 sub-agent activations.", "items", taskItem);
         Map<String, Object> schema = Map.of("type", "object",
                 "properties", Map.of("mode", mode, "tasks", tasks), "required", List.of("tasks"));
         return new ToolDef(SPAWN_SUBAGENTS,
-                "Delegate work to parallel or chained sub-agents that share your tools and budget.", schema);
+                "Activate declared sub-agents (parallel or chained); each runs in its own context and "
+                        + "returns its result to you.", schema);
     }
 
     // ------------------------------------------------------------- message helpers
@@ -620,26 +650,39 @@ public class FlowEngine {
         return def;
     }
 
+    private static String taskField(Map<String, Object> task, String key) {
+        Object v = task.get(key);
+        return v == null ? "" : String.valueOf(v);
+    }
+
     private static int clamp(int v, int lo, int hi) {
         return Math.max(lo, Math.min(hi, v));
     }
 
-    private static String truncate(String s, int max) {
-        if (s == null) return "";
-        return s.length() <= max ? s : s.substring(0, max - 1) + "…";
+    // ------------------------------------------------------------- per-run state
+
+    /** A resolved agent: its skills, functions, MCPs and advertised tools. */
+    private static final class Agent {
+        final String name;
+        final List<Capability> alwaysSkills = new ArrayList<>();
+        final Map<String, Capability> onDemandSkills = new LinkedHashMap<>();
+        final Map<String, Capability> functionsBySlug = new LinkedHashMap<>();
+        final Map<String, Capability> mcpBySlug = new LinkedHashMap<>();
+        List<ToolDef> tools = List.of();
+
+        Agent(String name) { this.name = name; }
     }
 
-    // ------------------------------------------------------------- per-run state
+    /** A declared sub-agent: defined by a skill, with its own assigned capabilities and activation hint. */
+    private record SubagentDef(String name, String skillSlug, String when, List<String> capabilitySlugs) {}
 
     /** Per-execution context — keeps the engine bean stateless and thread-safe across runs. */
     private final class Exec {
         final Run run;
         final Flow flow;
         final Provider provider;
-        final List<Capability> alwaysSkills = new ArrayList<>();
-        final Map<String, Capability> onDemandSkills = new LinkedHashMap<>();
-        final List<ToolDef> workerTools;
-        final List<ToolDef> orchestratorTools;
+        final Map<String, SubagentDef> subagentDefs;
+        final Agent orchestrator;
         final java.util.Set<String> loadedSkills = ConcurrentHashMap.newKeySet();
         final AtomicInteger seq = new AtomicInteger();
         final AtomicInteger iterations = new AtomicInteger();
@@ -650,31 +693,90 @@ public class FlowEngine {
             this.run = run;
             this.flow = flow;
             this.provider = provider;
-            for (Capability c : flow.getCapabilities()) {
-                if (!"skill".equals(c.getType())) continue;
-                if ("on-demand".equalsIgnoreCase(String.valueOf(c.getSpec().get("loads")))) {
-                    onDemandSkills.put(c.getSlug(), c);
-                } else {
-                    alwaysSkills.add(c);
-                }
-            }
-            List<ToolDef> worker = new ArrayList<>(capabilityTools(flow));
-            if (!onDemandSkills.isEmpty()) worker.add(loadSkillTool(onDemandSkills));
-            this.workerTools = List.copyOf(worker);
-            List<ToolDef> orch = new ArrayList<>(worker);
-            orch.add(spawnSubagentsTool());
-            this.orchestratorTools = List.copyOf(orch);
+            this.subagentDefs = parseSubagentDefs(flow);
+            this.orchestrator = buildAgent("orchestrator", flow.getCapabilities(), null, !subagentDefs.isEmpty());
         }
+
+        /** Build an agent from a set of capabilities, an optional always-on defining skill, and spawn access. */
+        Agent buildAgent(String name, Collection<Capability> caps, Capability definingSkill, boolean withSpawn) {
+            Agent a = new Agent(name);
+            if (definingSkill != null) a.alwaysSkills.add(definingSkill);
+            for (Capability c : caps) {
+                if (c == definingSkill) continue;
+                classify(a, c);
+            }
+            List<ToolDef> tools = new ArrayList<>();
+            for (Capability c : a.functionsBySlug.values()) tools.add(functionToolDef(c));
+            for (Capability c : a.mcpBySlug.values()) tools.addAll(mcp.toolDefs(c));
+            if (!a.onDemandSkills.isEmpty()) tools.add(loadSkillTool(a.onDemandSkills));
+            if (withSpawn) tools.add(spawnSubagentsTool(subagentDefs.keySet()));
+            a.tools = List.copyOf(tools);
+            return a;
+        }
+
+        private void classify(Agent a, Capability c) {
+            if ("skill".equals(c.getType())) {
+                if ("on-demand".equalsIgnoreCase(String.valueOf(c.getSpec().get("loads")))) {
+                    a.onDemandSkills.put(c.getSlug(), c);
+                } else {
+                    a.alwaysSkills.add(c);
+                }
+            } else if ("function".equals(c.getType()) && js.isExecutable(c.getSpec())) {
+                a.functionsBySlug.put(c.getSlug(), c);
+            } else if ("mcp".equals(c.getType()) && mcp.isBuiltin(c)) {
+                a.mcpBySlug.put(c.getSlug(), c);
+            }
+        }
+
+        /** Resolve a declared sub-agent into a runnable agent (its defining skill + assigned capabilities). */
+        Agent subagentAgent(SubagentDef def) {
+            Capability defining = findCapability(def.skillSlug());
+            List<Capability> assigned = new ArrayList<>();
+            for (String slug : def.capabilitySlugs()) {
+                Capability c = findCapability(slug);
+                if (c != null) assigned.add(c);
+            }
+            return buildAgent(def.name(), assigned, defining, false);
+        }
+
+        Capability findCapability(String slug) {
+            if (slug == null || slug.isBlank()) return null;
+            for (Capability c : flow.getCapabilities()) {
+                if (slug.equals(c.getSlug())) return c;
+            }
+            return null;
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, SubagentDef> parseSubagentDefs(Flow flow) {
+        Map<String, SubagentDef> defs = new LinkedHashMap<>();
+        Object s = flow.getConfig().get("subagents");
+        if (s instanceof Map<?, ?> sm && sm.get("agents") instanceof List<?> list) {
+            for (Object o : list) {
+                if (!(o instanceof Map<?, ?> m) || m.get("name") == null) continue;
+                String name = String.valueOf(m.get("name")).trim();
+                if (name.isBlank()) continue;
+                String skill = m.get("skill") == null ? "" : String.valueOf(m.get("skill"));
+                String when = m.get("when") == null ? "" : String.valueOf(m.get("when"));
+                List<String> caps = new ArrayList<>();
+                if (m.get("capabilities") instanceof List<?> cl) {
+                    for (Object c : cl) caps.add(String.valueOf(c));
+                }
+                defs.put(name, new SubagentDef(name, skill, when, caps));
+            }
+        }
+        return defs;
     }
 
     /** Result of one orchestrator/sub-agent loop. */
     private record LoopOut(String content, int tokens) {}
 
-    /** Outcome of a single sub-agent. */
-    private record SubResult(String objective, String answer,
+    /** Outcome of a single sub-agent activation. */
+    private record SubResult(String agent, String input, String skill, String answer,
                              List<Map<String, Object>> activity, int tokens, boolean skipped) {
-        static SubResult skipped(String objective) {
-            return new SubResult(objective, null, List.of(), 0, true);
+        static SubResult skipped(Map<String, Object> task) {
+            return new SubResult(taskField(task, "agent"), taskField(task, "input"), "", null, List.of(), 0, true);
         }
     }
 }
